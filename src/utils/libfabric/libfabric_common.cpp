@@ -22,6 +22,7 @@
 #include <iomanip>
 #include <sstream>
 #include <atomic>
+#include <fstream>
 
 #include <rdma/fabric.h>
 #include <rdma/fi_domain.h>
@@ -38,17 +39,77 @@ getAvailableEfaDevices() {
         return devices;
     }
 
+    // First try EFA provider
     hints->fabric_attr->prov_name = strdup("efa");
     int ret = fi_getinfo(FI_VERSION(1, 9), NULL, NULL, 0, hints, &info);
+    if (ret == 0) {
+        NIXL_DEBUG << "Found EFA provider, using EFA devices";
+        for (struct fi_info *cur = info; cur; cur = cur->next) {
+            if (cur->domain_attr && cur->domain_attr->name) {
+                devices.push_back(cur->domain_attr->name);
+            }
+        }
+        fi_freeinfo(info);
+        fi_freeinfo(hints);
+        return devices;
+    }
+
+    NIXL_DEBUG << "EFA provider not available, trying TCP provider";
+    fi_freeinfo(hints);
+
+    // If EFA not available, try TCP provider
+    hints = fi_allocinfo();
+    if (!hints) {
+        NIXL_ERROR << "Failed to allocate fi_info for TCP device discovery";
+        return devices;
+    }
+
+    hints->fabric_attr->prov_name = strdup("tcp");
+    hints->ep_attr->type = FI_EP_RDM;  // Use RDM endpoint type
+    ret = fi_getinfo(FI_VERSION(1, 9), NULL, NULL, 0, hints, &info);
+    if (ret == 0) {
+        NIXL_DEBUG << "Found TCP provider, using TCP devices";
+        for (struct fi_info *cur = info; cur; cur = cur->next) {
+            if (cur->domain_attr && cur->domain_attr->name) {
+                // Skip loopback interface for better performance
+                std::string domain_name = cur->domain_attr->name;
+                if (domain_name != "lo") {
+                    devices.push_back(domain_name);
+                }
+            }
+        }
+        fi_freeinfo(info);
+        fi_freeinfo(hints);
+        return devices;
+    }
+
+    NIXL_DEBUG << "TCP provider not available, trying any available provider";
+    fi_freeinfo(hints);
+
+    // If neither EFA nor TCP available, try any provider
+    hints = fi_allocinfo();
+    if (!hints) {
+        NIXL_ERROR << "Failed to allocate fi_info for generic device discovery";
+        return devices;
+    }
+
+    // Don't specify provider name - let libfabric choose
+    hints->ep_attr->type = FI_EP_RDM;
+    ret = fi_getinfo(FI_VERSION(1, 9), NULL, NULL, 0, hints, &info);
     if (ret) {
         NIXL_ERROR << "fi_getinfo failed during device discovery: " << fi_strerror(-ret);
         fi_freeinfo(hints);
         return devices;
     }
 
+    NIXL_DEBUG << "Using generic provider discovery";
     for (struct fi_info *cur = info; cur; cur = cur->next) {
         if (cur->domain_attr && cur->domain_attr->name) {
-            devices.push_back(cur->domain_attr->name);
+            // Skip loopback interface for better performance
+            std::string domain_name = cur->domain_attr->name;
+            if (domain_name != "lo") {
+                devices.push_back(domain_name);
+            }
         }
     }
 
@@ -92,6 +153,35 @@ preallocateXferIds(size_t count) {
     }
 
     return xfer_ids;
+}
+
+std::string
+getAwsInstanceType() {
+    const char* dmi_product_path = "/sys/devices/virtual/dmi/id/product_name";
+
+    std::ifstream file(dmi_product_path);
+    if (!file.is_open()) {
+        NIXL_DEBUG << "Could not open DMI product name file: " << dmi_product_path;
+        return "";
+    }
+
+    std::string instance_type;
+    std::getline(file, instance_type);
+    file.close();
+
+    // Remove any trailing whitespace/newlines
+    size_t end = instance_type.find_last_not_of(" \t\n\r");
+    if (end != std::string::npos) {
+        instance_type = instance_type.substr(0, end + 1);
+    }
+
+    if (instance_type.empty()) {
+        NIXL_DEBUG << "DMI product name is empty";
+        return "";
+    }
+
+    NIXL_DEBUG << "Detected AWS instance type: " << instance_type;
+    return instance_type;
 }
 
 } // namespace LibfabricUtils

@@ -153,6 +153,9 @@ namespace LibfabricUtils {
 // Device discovery
 std::vector<std::string>
 getAvailableEfaDevices();
+// AWS instance detection
+std::string
+getAwsInstanceType();
 // String utilities
 std::string
 hexdump(const void *data);

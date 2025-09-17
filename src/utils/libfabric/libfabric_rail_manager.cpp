@@ -79,7 +79,7 @@ nixlLibfabricRailManager::createDataRails(const std::vector<std::string> &efa_de
 
         for (size_t i = 0; i < num_data_rails_; ++i) {
             data_rails_.emplace_back(
-                std::make_unique<nixlLibfabricRail>(efa_devices[i], static_cast<uint16_t>(i)));
+                std::make_unique<nixlLibfabricRail>(efa_devices[i], static_cast<uint16_t>(i), ::RailType::DATA));
 
             // Initialize EFA device mapping
             efa_device_to_rail_map[efa_devices[i]] = i;
@@ -107,7 +107,7 @@ nixlLibfabricRailManager::createControlRails(const std::vector<std::string> &efa
 
         for (size_t i = 0; i < num_control_rails_; ++i) {
             control_rails_.emplace_back(
-                std::make_unique<nixlLibfabricRail>(efa_devices[i], static_cast<uint16_t>(i)));
+                std::make_unique<nixlLibfabricRail>(efa_devices[i], static_cast<uint16_t>(i), ::RailType::CONTROL));
             NIXL_DEBUG << "Created control rail " << i << " (device: " << efa_devices[i] << ")";
         }
     }
@@ -185,6 +185,8 @@ nixlLibfabricRailManager::prepareAndSubmitTransfer(nixlLibfabricReq::OpType op_t
                                                     req);
         }
         if (status != NIXL_SUCCESS) {
+            NIXL_ERROR << "Failed to post " << (op_type == nixlLibfabricReq::WRITE ? "write" : "read")
+                       << " operation on rail " << rail_id << " with XFER_ID " << req->xfer_id;
             data_rails_[rail_id]->releaseRequest(req);
             return status;
         }
@@ -192,6 +194,7 @@ nixlLibfabricRailManager::prepareAndSubmitTransfer(nixlLibfabricReq::OpType op_t
         // Collect XFER_ID directly in BinaryNotification
         if (binary_notif && binary_notif->xfer_id_count < NIXL_LIBFABRIC_MAX_XFER_IDS) {
             binary_notif->addXferId(req->xfer_id);
+            NIXL_DEBUG << "Added XFER_ID " << req->xfer_id << " to notification after successful post on rail " << rail_id;
         }
 
         NIXL_DEBUG << "Round-robin: submitted single request on rail " << rail_id << " for "
@@ -246,6 +249,9 @@ nixlLibfabricRailManager::prepareAndSubmitTransfer(nixlLibfabricReq::OpType op_t
                                                         req);
             }
             if (status != NIXL_SUCCESS) {
+                NIXL_ERROR << "Failed to post " << (op_type == nixlLibfabricReq::WRITE ? "write" : "read")
+                           << " operation on rail " << rail_id << " with XFER_ID " << req->xfer_id
+                           << " (chunk " << i << "/" << num_rails << ")";
                 data_rails_[rail_id]->releaseRequest(req);
                 return status;
             }
@@ -253,6 +259,8 @@ nixlLibfabricRailManager::prepareAndSubmitTransfer(nixlLibfabricReq::OpType op_t
             // Collect XFER_ID directly in BinaryNotification
             if (binary_notif && binary_notif->xfer_id_count < NIXL_LIBFABRIC_MAX_XFER_IDS) {
                 binary_notif->addXferId(req->xfer_id);
+                NIXL_DEBUG << "Added XFER_ID " << req->xfer_id << " to notification after successful post on rail " << rail_id
+                           << " (chunk " << i << "/" << num_rails << ")";
             }
         }
         NIXL_DEBUG << "Striping: submitted " << (binary_notif ? binary_notif->xfer_id_count : 0)
@@ -267,6 +275,22 @@ nixlLibfabricRailManager::prepareAndSubmitTransfer(nixlLibfabricReq::OpType op_t
 
 std::vector<size_t>
 nixlLibfabricRailManager::selectRailsForMemory(void *mem_addr, nixl_mem_t mem_type) const {
+    // For non-EFA providers (like TCP), use simplified rail selection
+    if (!isEfaProvider()) {
+        NIXL_DEBUG << "Using simplified rail selection for non-EFA provider";
+        std::vector<size_t> all_rails;
+        all_rails.reserve(data_rails_.size());
+        for (size_t i = 0; i < data_rails_.size(); ++i) {
+            all_rails.push_back(i);
+        }
+        NIXL_DEBUG << "Selected all " << all_rails.size() << " rails for "
+                   << (mem_type == VRAM_SEG ? "VRAM" : "DRAM") << " memory " << mem_addr;
+        return all_rails;
+    }
+
+    // EFA provider: use topology-aware selection
+    NIXL_DEBUG << "Using topology-aware rail selection for EFA provider";
+
     if (mem_type == VRAM_SEG) {
 #ifdef HAVE_CUDA
         int gpu_id = topology->detectGpuIdForMemory(mem_addr);
@@ -590,14 +614,20 @@ nixlLibfabricRailManager::postControlMessage(ControlMessageType msg_type,
 
 nixl_status_t
 nixlLibfabricRailManager::progressActiveDataRails() {
-
-    if (active_rails_.empty()) {
-        return NIXL_IN_PROG; // No active rails to process
+    // Create a local copy of active rails to avoid holding the mutex during progress
+    std::vector<size_t> active_rails_copy;
+    {
+        std::lock_guard<std::mutex> lock(active_rails_mutex_);
+        if (active_rails_.empty()) {
+            return NIXL_IN_PROG; // No active rails to process
+        }
+        active_rails_copy.reserve(active_rails_.size());
+        active_rails_copy.assign(active_rails_.begin(), active_rails_.end());
     }
 
     bool any_completions = false;
 
-    for (size_t rail_id : active_rails_) {
+    for (size_t rail_id : active_rails_copy) {
         if (rail_id >= data_rails_.size()) {
             NIXL_ERROR << "Invalid active rail ID: " << rail_id;
             continue;
@@ -614,7 +644,7 @@ nixlLibfabricRailManager::progressActiveDataRails() {
     }
 
     if (any_completions) {
-        NIXL_TRACE << "Processed " << active_rails_.size() << " active rails, completions found";
+        NIXL_TRACE << "Processed " << active_rails_copy.size() << " active rails, completions found";
     }
 
     return any_completions ? NIXL_SUCCESS : NIXL_IN_PROG;
@@ -820,6 +850,7 @@ nixlLibfabricRailManager::markRailActive(size_t rail_id) {
         return;
     }
 
+    std::lock_guard<std::mutex> lock(active_rails_mutex_);
     bool was_inserted = active_rails_.insert(rail_id).second;
 
     if (was_inserted) {
@@ -832,6 +863,7 @@ nixlLibfabricRailManager::markRailActive(size_t rail_id) {
 
 void
 nixlLibfabricRailManager::markRailInactive(size_t rail_id) {
+    std::lock_guard<std::mutex> lock(active_rails_mutex_);
     size_t erased = active_rails_.erase(rail_id);
     if (erased > 0) {
         NIXL_DEBUG << "Marked rail " << rail_id
@@ -843,6 +875,7 @@ nixlLibfabricRailManager::markRailInactive(size_t rail_id) {
 
 void
 nixlLibfabricRailManager::clearActiveRails() {
+    std::lock_guard<std::mutex> lock(active_rails_mutex_);
     size_t cleared_count = active_rails_.size();
     active_rails_.clear();
     NIXL_DEBUG << "Cleared " << cleared_count << " active rails";
@@ -850,5 +883,31 @@ nixlLibfabricRailManager::clearActiveRails() {
 
 size_t
 nixlLibfabricRailManager::getActiveRailCount() const {
+    std::lock_guard<std::mutex> lock(active_rails_mutex_);
     return active_rails_.size();
+}
+
+bool
+nixlLibfabricRailManager::isEfaProvider() const {
+    // Check if we have any data rails to examine
+    if (data_rails_.empty()) {
+        NIXL_DEBUG << "No data rails available, assuming non-EFA provider";
+        return false;
+    }
+
+    // Get the provider name from the first data rail
+    // All rails should use the same provider type
+    const char* provider_name = data_rails_[0]->getProviderName();
+    if (!provider_name) {
+        NIXL_DEBUG << "Could not get provider name, assuming non-EFA provider";
+        return false;
+    }
+
+    // Check if the provider is EFA
+    bool is_efa = (strcmp(provider_name, "efa") == 0);
+
+    NIXL_DEBUG << "Provider detection: " << provider_name << " -> "
+               << (is_efa ? "EFA" : "non-EFA") << " provider";
+
+    return is_efa;
 }

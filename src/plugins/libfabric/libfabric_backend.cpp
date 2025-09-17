@@ -743,7 +743,8 @@ nixlLibfabricEngine::establishConnection(const std::string &remote_agent) const 
     );
     if (status != NIXL_SUCCESS) {
         NIXL_ERROR << "postSend failed on rail " << 0;
-        // TODO, wrap req info into a nixlLibfabricRequestHandle and add retry logic
+        // Release the control request since we failed to send it
+        rail_manager.getControlRail(control_rail_id).releaseRequest(control_request);
         return NIXL_ERR_BACKEND;
     }
     // Register the connection state tracker with the CM thread
@@ -765,7 +766,7 @@ nixlLibfabricEngine::establishConnection(const std::string &remote_agent) const 
         }
     }
 
-    NIXL_DEBUG << "Connection already established for agent: " << remote_agent;
+    NIXL_DEBUG << "Connection established successfully for agent: " << remote_agent;
     return NIXL_SUCCESS;
 }
 
@@ -849,6 +850,55 @@ nixlLibfabricEngine::registerMem(const nixlBlobDesc &mem,
                << (nixl_mem == VRAM_SEG ? "VRAM" : "DRAM") << " memory on "
                << priv->selected_rails_.size() << " rails"
                << (nixl_mem == VRAM_SEG ? " with GPU Direct RDMA support" : "");
+
+    // For TCP providers, post receives to user memory buffers to enable TCP senddata architecture
+    // This allows fi_senddata operations to send data directly to registered memory
+    for (size_t i = 0; i < priv->selected_rails_.size(); ++i) {
+        size_t rail_id = priv->selected_rails_[i];
+        nixlLibfabricRail& rail = rail_manager.getDataRail(rail_id);
+
+        // Check if this is a TCP provider
+        const char* provider_name = rail.getProviderName();
+        if (provider_name && strcmp(provider_name, "tcp") == 0) {
+            // Allocate a data request for user memory receive
+            nixlLibfabricReq *user_req = rail.allocateDataRequest(nixlLibfabricReq::RECV);
+            if (user_req) {
+                // Set up the request to point to the user memory
+                user_req->buffer = (void *)mem.addr;
+                user_req->buffer_size = mem.len;
+                user_req->mr = priv->rail_mr_list_[rail_id];
+                user_req->local_addr = (void *)mem.addr;
+
+                // Post receive to user memory using fi_recvmsg
+                struct fi_msg msg = {};
+                struct iovec msg_iov;
+                void *desc = fi_mr_desc(priv->rail_mr_list_[rail_id]);
+
+                msg_iov.iov_base = (void *)mem.addr;
+                msg_iov.iov_len = mem.len;
+
+                msg.msg_iov = &msg_iov;
+                msg.desc = &desc;
+                msg.iov_count = 1;
+                msg.addr = FI_ADDR_UNSPEC;
+                msg.context = &user_req->ctx;
+                msg.data = 0;
+
+                int ret = fi_recvmsg(rail.endpoint, &msg, 0);
+                if (ret) {
+                    NIXL_WARN << "fi_recvmsg failed for user memory receive on rail " << rail_id << ": " << fi_strerror(-ret);
+                    rail.releaseRequest(user_req);
+                    // Don't fail memory registration if receive posting fails
+                } else {
+                    NIXL_DEBUG << "TCP senddata: posted receive to user memory buffer on rail " << rail_id
+                              << " buffer: " << (void *)mem.addr << " size: " << mem.len;
+                }
+            } else {
+                NIXL_WARN << "Failed to allocate data request for user memory receive on rail " << rail_id;
+                // Don't fail memory registration if request allocation fails
+            }
+        }
+    }
 
     NIXL_DEBUG << "Successfully registered memory on " << priv->selected_rails_.size()
                << " rails for " << (nixl_mem == VRAM_SEG ? "GPU" : "CPU") << " " << mem.devId;

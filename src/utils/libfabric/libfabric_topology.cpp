@@ -96,16 +96,18 @@ nixlLibfabricTopology::discoverTopology() {
 
 nixl_status_t
 nixlLibfabricTopology::discoverEfaDevices() {
-    // Use the utility function from libfabric_common
+    // Use the utility function from libfabric_common (now supports multiple providers)
     all_efa_devices = LibfabricUtils::getAvailableEfaDevices();
     num_efa_devices = all_efa_devices.size();
     if (all_efa_devices.empty()) {
-        NIXL_ERROR << "No EFA devices found";
-        return NIXL_ERR_BACKEND;
+        NIXL_WARN << "No libfabric devices found, creating fallback device";
+        // Create a fallback device for systems without hardware acceleration
+        all_efa_devices.push_back("fallback");
+        num_efa_devices = 1;
     }
-    NIXL_TRACE << "Discovered " << num_efa_devices << " EFA devices";
+    NIXL_TRACE << "Discovered " << num_efa_devices << " libfabric devices";
     for (size_t i = 0; i < all_efa_devices.size(); ++i) {
-        NIXL_TRACE << "EFA device " << i << ": " << all_efa_devices[i];
+        NIXL_TRACE << "Libfabric device " << i << ": " << all_efa_devices[i];
     }
     return NIXL_SUCCESS;
 }
@@ -458,21 +460,47 @@ nixlLibfabricTopology::buildPcieToLibfabricMapping() {
     pcie_to_libfabric_map.clear();
     libfabric_to_pcie_map.clear();
 
-    // Get EFA device info with PCIe addresses from libfabric
-    struct fi_info *hints, *info;
+    // Get available devices from the same provider detection logic
+    std::vector<std::string> available_devices = LibfabricUtils::getAvailableEfaDevices();
+    if (available_devices.empty()) {
+        NIXL_WARN << "No libfabric devices available for PCIe mapping";
+        return NIXL_SUCCESS; // Not an error for TCP providers
+    }
 
+    // Detect which provider we're using
+    struct fi_info *hints, *info;
     hints = fi_allocinfo();
     if (!hints) {
         NIXL_ERROR << "Failed to allocate fi_info for PCIe mapping";
         return NIXL_ERR_BACKEND;
     }
 
+    // Try EFA first, then TCP
+    int ret = -1;
+    std::string provider_name;
+
+    // Try EFA provider
     hints->fabric_attr->prov_name = strdup("efa");
-    int ret = fi_getinfo(FI_VERSION(1, 9), NULL, NULL, 0, hints, &info);
+    ret = fi_getinfo(FI_VERSION(1, 9), NULL, NULL, 0, hints, &info);
+    if (ret == 0) {
+        provider_name = "efa";
+        NIXL_TRACE << "Using EFA provider for PCIe mapping";
+    } else {
+        // EFA failed, try TCP
+        free(hints->fabric_attr->prov_name);
+        hints->fabric_attr->prov_name = strdup("tcp");
+        ret = fi_getinfo(FI_VERSION(1, 9), NULL, NULL, 0, hints, &info);
+        if (ret == 0) {
+            provider_name = "tcp";
+            NIXL_TRACE << "Using TCP provider for PCIe mapping (PCIe info may not be available)";
+        }
+    }
+
     if (ret) {
-        NIXL_ERROR << "fi_getinfo failed for PCIe mapping: " << fi_strerror(-ret);
+        NIXL_WARN << "fi_getinfo failed for PCIe mapping with both EFA and TCP: " << fi_strerror(-ret);
         fi_freeinfo(hints);
-        return NIXL_ERR_BACKEND;
+        // For TCP providers, this is not a fatal error since PCIe mapping is not needed
+        return NIXL_SUCCESS;
     }
 
     for (struct fi_info *cur = info; cur; cur = cur->next) {

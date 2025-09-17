@@ -20,8 +20,11 @@
 #include "common/nixl_log.h"
 #include "serdes/serdes.h"
 
+#include <atomic>
+#include <chrono>
 #include <cstring>
 #include <stdexcept>
+#include <thread>
 
 // RequestPool Base Class Implementation
 
@@ -187,10 +190,11 @@ DataRequestPool::allocate(nixlLibfabricReq::OpType op_type) {
 
 // Rail Class Implementation
 
-nixlLibfabricRail::nixlLibfabricRail(const std::string &device, uint16_t id)
+nixlLibfabricRail::nixlLibfabricRail(const std::string &device, uint16_t id, RailType rail_type)
     : rail_id(id),
       device_name(device),
       blocking_cq_sread_supported(true),
+      rail_type(rail_type),
       control_request_pool_(CONTROL_REQUESTS_PER_RAIL, id),
       data_request_pool_(DATA_REQUESTS_PER_RAIL, id) {
     // Initialize all pointers to nullptr
@@ -211,16 +215,31 @@ nixlLibfabricRail::nixlLibfabricRail(const std::string &device, uint16_t id)
         NIXL_ERROR << "fi_allocinfo failed for rail " << rail_id;
         throw std::runtime_error("Failed to allocate fi_info for rail " + std::to_string(rail_id));
     }
-    hints->caps = 0;
-    hints->caps = FI_MSG | FI_RMA | FI_HMEM;
-    hints->caps |= FI_LOCAL_COMM | FI_REMOTE_COMM;
-    hints->mode = FI_CONTEXT | FI_CONTEXT2;
-    hints->ep_attr->type = FI_EP_RDM;
-    hints->domain_attr->mr_mode =
-        FI_MR_LOCAL | FI_MR_HMEM | FI_MR_VIRT_ADDR | FI_MR_ALLOCATED | FI_MR_PROV_KEY;
-    hints->domain_attr->mr_key_size = 2;
-    hints->domain_attr->name = strdup(device_name.c_str());
-    hints->domain_attr->threading = FI_THREAD_SAFE;
+
+    // For TCP providers, use TCP-compatible hints with RMA support
+    // For EFA providers, use the full EFA-specific configuration
+    if (device_name.find("ens") == 0 || device_name == "tcp") {
+        // TCP provider - supports both MSG and RMA according to documentation
+        hints->caps = FI_MSG | FI_RMA;
+        hints->mode = FI_CONTEXT;
+        hints->ep_attr->type = FI_EP_RDM;
+        hints->domain_attr->mr_mode = FI_MR_LOCAL | FI_MR_VIRT_ADDR | FI_MR_ALLOCATED;
+        hints->domain_attr->name = nullptr;
+        hints->domain_attr->threading = FI_THREAD_SAFE;
+        NIXL_TRACE << "Using TCP provider hints with MSG and RMA support for rail " << rail_id;
+    } else {
+        // EFA or other hardware provider - use full EFA configuration
+        hints->caps = FI_MSG | FI_RMA | FI_HMEM;
+        hints->caps |= FI_LOCAL_COMM | FI_REMOTE_COMM;
+        hints->mode = FI_CONTEXT | FI_CONTEXT2;
+        hints->ep_attr->type = FI_EP_RDM;
+        hints->domain_attr->mr_mode =
+            FI_MR_LOCAL | FI_MR_HMEM | FI_MR_VIRT_ADDR | FI_MR_ALLOCATED | FI_MR_PROV_KEY;
+        hints->domain_attr->mr_key_size = 2;
+        hints->domain_attr->name = strdup(device_name.c_str());
+        hints->domain_attr->threading = FI_THREAD_SAFE;
+        NIXL_TRACE << "Using EFA provider hints with device-specific domain name '" << device_name << "' for rail " << rail_id;
+    }
     try {
         // Get fabric info for this specific device
         int ret = fi_getinfo(FI_VERSION(1, 9), NULL, NULL, 0, hints, &info);
@@ -705,6 +724,71 @@ nixlLibfabricRail::processRecvCompletion(struct fi_cq_data_entry *comp) {
             NIXL_ERROR << "No notification callback set!";
             return NIXL_ERR_BACKEND;
         }
+    } else if (msg_type == NIXL_LIBFABRIC_MSG_TRANSFER) {
+        NIXL_DEBUG << "TCP senddata: Data received directly to registered memory for XFER_ID " << xfer_id
+                  << " - no copying required";
+
+        // Call XFER_ID tracking callback to add received XFER_ID to global set
+        if (xferIdCallback) {
+            xferIdCallback(xfer_id);
+            NIXL_DEBUG << "TCP senddata: XFER_ID callback called for XFER_ID " << xfer_id
+                      << " - added to received set";
+        } else {
+            NIXL_ERROR << "No XFER_ID callback set for rail " << rail_id;
+            return NIXL_ERR_BACKEND;
+        }
+
+        NIXL_DEBUG << "TCP senddata: Transfer completion processed for XFER_ID " << xfer_id;
+
+        // For TCP senddata transfers, we need to repost the receive to the same user memory buffer
+        // Save user memory information before releasing the request
+        void *user_buffer = req->buffer;
+        size_t user_buffer_size = req->buffer_size;
+        struct fid_mr *user_mr = req->mr;
+        void *user_local_addr = req->local_addr;
+
+        // Release the current request
+        releaseRequest(req);
+
+        // Repost receive to the same user memory buffer for next transfer
+        nixlLibfabricReq *new_user_req = allocateDataRequest(nixlLibfabricReq::RECV);
+        if (!new_user_req) {
+            NIXL_ERROR << "Failed to allocate data request for reposting user memory receive on rail " << rail_id;
+            return NIXL_ERR_BACKEND;
+        }
+
+        // Set up the new request to point to the same user memory
+        new_user_req->buffer = user_buffer;
+        new_user_req->buffer_size = user_buffer_size;
+        new_user_req->mr = user_mr;
+        new_user_req->local_addr = user_local_addr;
+
+        // Post receive to user memory using fi_recvmsg
+        struct fi_msg msg = {};
+        struct iovec msg_iov;
+        void *desc = fi_mr_desc(user_mr);
+
+        msg_iov.iov_base = user_buffer;
+        msg_iov.iov_len = user_buffer_size;
+
+        msg.msg_iov = &msg_iov;
+        msg.desc = &desc;
+        msg.iov_count = 1;
+        msg.addr = FI_ADDR_UNSPEC;
+        msg.context = &new_user_req->ctx;
+        msg.data = 0;
+
+        int ret = fi_recvmsg(endpoint, &msg, 0);
+        if (ret) {
+            NIXL_ERROR << "fi_recvmsg failed for reposting user memory receive on rail " << rail_id << ": " << fi_strerror(-ret);
+            releaseRequest(new_user_req);
+            return NIXL_ERR_BACKEND;
+        }
+
+        NIXL_DEBUG << "TCP senddata: successfully reposted receive to user memory on rail " << rail_id;
+
+        // Return early since we already released the original request
+        return NIXL_SUCCESS;
     } else if (msg_type == NIXL_LIBFABRIC_MSG_DISCONNECT) {
         NIXL_TRACE << "Processing disconnect request from agent " << agent_idx << " on rail "
                    << rail_id
@@ -820,15 +904,39 @@ nixlLibfabricRail::postSend(uint64_t immediate_data,
                << " XFER_ID: " << NIXL_GET_XFER_ID_FROM_IMM(immediate_data)
                << " dest_addr: " << dest_addr << std::dec << " context: " << &req->ctx;
 
-    // Libfabric fi_senddata call
-    int ret = fi_senddata(
-        endpoint, req->buffer, req->buffer_size, desc, immediate_data, dest_addr, &req->ctx);
-    if (ret) {
-        NIXL_ERROR << "fi_senddata failed on rail " << rail_id << ": " << fi_strerror(-ret);
+    // Retry mechanism for TCP provider compatibility
+    const int max_retries = 10;
+    const int retry_delay_ms = 50;
+
+    for (int retry = 0; retry < max_retries; ++retry) {
+        // Libfabric fi_senddata call
+        int ret = fi_senddata(
+            endpoint, req->buffer, req->buffer_size, desc, immediate_data, dest_addr, &req->ctx);
+
+        if (ret == 0) {
+            NIXL_TRACE << "Send posted successfully" << (retry > 0 ? " on retry " + std::to_string(retry + 1) : "");
+            return NIXL_SUCCESS;
+        }
+
+        // Check if this is a "Resource temporarily unavailable" error
+        if (ret == -FI_EAGAIN) {
+            if (retry < max_retries - 1) {
+                NIXL_DEBUG << "fi_senddata temporarily unavailable on rail " << rail_id
+                          << ", retrying in " << retry_delay_ms << "ms (attempt " << (retry + 1) << "/" << max_retries << ")";
+                std::this_thread::sleep_for(std::chrono::milliseconds(retry_delay_ms));
+                continue;
+            }
+        }
+
+        // For other errors or max retries reached, fail immediately
+        NIXL_ERROR << "fi_senddata failed on rail " << rail_id << " after " << (retry + 1)
+                   << " attempts: " << fi_strerror(-ret);
         return NIXL_ERR_BACKEND;
     }
-    NIXL_TRACE << "Send posted successfully";
-    return NIXL_SUCCESS;
+
+    // Should never reach here, but just in case
+    NIXL_ERROR << "fi_senddata failed on rail " << rail_id << " after " << max_retries << " retries";
+    return NIXL_ERR_BACKEND;
 }
 
 nixl_status_t
@@ -846,8 +954,59 @@ nixlLibfabricRail::postWrite(const void *local_buffer,
         return NIXL_ERR_INVALID_PARAM;
     }
 
-    // Setup and logging
-    NIXL_TRACE << "Posting RDMA write on endpoint: " << std::hex << endpoint
+    // Check if this is a TCP provider - if so, use fi_senddata fallback
+    const char* provider_name = getProviderName();
+    if (provider_name && strcmp(provider_name, "tcp") == 0) {
+        NIXL_DEBUG << "TCP provider detected - using fi_senddata fallback with registered memory for rail " << rail_id;
+
+        // For TCP provider, use fi_senddata with the registered memory buffer
+        // This sends the actual data content rather than doing RDMA write
+        NIXL_TRACE << "TCP fallback: Posting senddata on endpoint: " << std::hex << endpoint
+                   << " local_buffer: " << local_buffer << " length: " << length
+                   << " immediate_data: " << immediate_data << " dest_addr: " << dest_addr
+                   << " context: " << &req->ctx;
+
+        // Retry mechanism for TCP provider compatibility
+        const int max_retries = 10;
+        const int retry_delay_ms = 50;
+
+        for (int retry = 0; retry < max_retries; ++retry) {
+            // Use fi_senddata with the registered memory buffer
+            int ret = fi_senddata(endpoint,
+                                  local_buffer,
+                                  length,
+                                  local_desc,
+                                  immediate_data,
+                                  dest_addr,
+                                  &req->ctx);
+
+            if (ret == 0) {
+                NIXL_TRACE << "TCP fallback: senddata posted successfully" << (retry > 0 ? " on retry " + std::to_string(retry + 1) : "");
+                return NIXL_SUCCESS;
+            }
+
+            // Check if this is a "Resource temporarily unavailable" error
+            if (ret == -FI_EAGAIN) {
+                if (retry < max_retries - 1) {
+                    NIXL_DEBUG << "TCP fallback: fi_senddata temporarily unavailable on rail " << rail_id
+                              << ", retrying in " << retry_delay_ms << "ms (attempt " << (retry + 1) << "/" << max_retries << ")";
+                    std::this_thread::sleep_for(std::chrono::milliseconds(retry_delay_ms));
+                    continue;
+                }
+            }
+
+            // For other errors or max retries reached, fail immediately
+            NIXL_ERROR << "TCP fallback: fi_senddata failed on rail " << rail_id << " after " << (retry + 1)
+                       << " attempts: " << fi_strerror(-ret);
+            return NIXL_ERR_BACKEND;
+        }
+
+        NIXL_ERROR << "TCP fallback: fi_senddata failed on rail " << rail_id << " after " << max_retries << " retries";
+        return NIXL_ERR_BACKEND;
+    }
+
+    // For EFA and other providers, use standard fi_writedata
+    NIXL_TRACE << "EFA provider: Posting RDMA write on endpoint: " << std::hex << endpoint
                << " local_buffer: " << local_buffer << " length: " << length
                << " immediate_data: " << immediate_data << " dest_addr: " << dest_addr
                << " remote_addr: " << (void *)remote_addr << " remote_key: " << remote_key
@@ -918,14 +1077,42 @@ nixlLibfabricRail::registerMemory(void *buffer,
     }
 
     struct fid_mr *mr;
-    int ret = fi_mr_reg(domain, buffer, length, access_flags, 0, 0, 0, &mr, NULL);
-    if (ret) {
-        NIXL_ERROR << "fi_mr_reg failed on rail " << rail_id << ": " << fi_strerror(-ret);
-        return NIXL_ERR_BACKEND;
-    }
+    int ret;
 
-    *mr_out = mr;
-    *key_out = fi_mr_key(mr);
+    // For TCP providers, we need to manually assign unique keys
+    // since they don't properly support FI_MR_PROV_KEY
+    const char* provider_name = getProviderName();
+    if (provider_name && strcmp(provider_name, "tcp") == 0) {
+        // Generate a unique key based on rail_id and a static counter
+        static std::atomic<uint64_t> tcp_key_counter{1};
+        uint64_t requested_key = (static_cast<uint64_t>(rail_id) << 32) | tcp_key_counter.fetch_add(1);
+
+        ret = fi_mr_reg(domain, buffer, length, access_flags, 0, requested_key, 0, &mr, NULL);
+
+        if (ret) {
+            NIXL_ERROR << "fi_mr_reg failed on rail " << rail_id << " with key " << requested_key
+                       << ": " << fi_strerror(-ret);
+            return NIXL_ERR_BACKEND;
+        }
+
+        *mr_out = mr;
+        *key_out = requested_key;
+
+        NIXL_DEBUG << "TCP provider: registered memory on rail " << rail_id
+                   << " with manually assigned key " << requested_key;
+
+    } else {
+        // For EFA and other providers, use provider-assigned keys
+        ret = fi_mr_reg(domain, buffer, length, access_flags, 0, 0, 0, &mr, NULL);
+
+        if (ret) {
+            NIXL_ERROR << "fi_mr_reg failed on rail " << rail_id << ": " << fi_strerror(-ret);
+            return NIXL_ERR_BACKEND;
+        }
+
+        *mr_out = mr;
+        *key_out = fi_mr_key(mr);
+    }
 
     return NIXL_SUCCESS;
 }
@@ -1006,6 +1193,15 @@ nixlLibfabricRail::getMemoryKey(struct fid_mr *mr) const {
         return 0;
     }
     return fi_mr_key(mr);
+}
+
+const char *
+nixlLibfabricRail::getProviderName() const {
+    if (!info || !info->fabric_attr) {
+        NIXL_ERROR << "No fabric info available on rail " << rail_id;
+        return nullptr;
+    }
+    return info->fabric_attr->prov_name;
 }
 
 // Optimized Resource Management Methods

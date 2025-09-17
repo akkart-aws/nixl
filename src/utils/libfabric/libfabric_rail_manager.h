@@ -300,10 +300,15 @@ private:
 
     // Active Rail Tracking System
     std::unordered_set<size_t> active_rails_;
+    mutable std::mutex active_rails_mutex_;
 
     // Internal rail selection method
     std::vector<size_t>
     selectRailsForMemory(void *mem_addr, nixl_mem_t mem_type) const;
+
+    // Provider detection method
+    bool
+    isEfaProvider() const;
 
     // Helper functions for connection SerDes
     void

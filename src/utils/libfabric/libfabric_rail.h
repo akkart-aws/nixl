@@ -32,6 +32,12 @@
 // Forward declarations
 class nixlLibfabricConnection;
 
+/** Rail type enumeration for control vs data rail separation */
+enum class RailType {
+    CONTROL,  // For connection management and notifications
+    DATA      // For actual data transfers
+};
+
 /**
  * @brief Request structure for libfabric operations
  *
@@ -212,9 +218,10 @@ public:
     char ep_name[LF_EP_NAME_MAX_LEN]; ///< Endpoint name for connection setup
     mutable bool blocking_cq_sread_supported; ///< Whether blocking CQ reads are supported
     struct fid_ep *endpoint; ///< Libfabric endpoint handle
+    RailType rail_type; ///< Rail type (CONTROL or DATA)
 
     /** Initialize libfabric rail with all resources */
-    nixlLibfabricRail(const std::string &device, uint16_t id);
+    nixlLibfabricRail(const std::string &device, uint16_t id, RailType rail_type);
 
     /** Destroy rail and cleanup all libfabric resources */
     ~nixlLibfabricRail();
@@ -265,6 +272,10 @@ public:
     /** Get remote access key for MR */
     uint64_t
     getMemoryKey(struct fid_mr *mr) const;
+
+    /** Get provider name for this rail */
+    const char *
+    getProviderName() const;
 
     // Libfabric operation wrappers
     /** Post receive operation */
