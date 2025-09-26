@@ -155,9 +155,9 @@ getNextXferId();
 
 // Utility functions
 namespace LibfabricUtils {
-// Device discovery
+// Device discovery with fallback (EFA -> TCP -> Sockets)
 std::pair<std::string, std::vector<std::string>>
-getAvailableEfaDevices();
+getAvailableNetworkDevices();
 // String utilities
 std::string
 hexdump(const void *data);

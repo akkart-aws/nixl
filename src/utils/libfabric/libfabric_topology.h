@@ -24,29 +24,34 @@
 #include <map>
 
 /**
- * @brief Topology discovery and management for AWS instances with EFA devices
+ * @brief Topology discovery and management for network devices with graceful fallback
  *
- * Automatically discovers system topology using hwloc and maps GPUs to EFA devices
- * based on PCIe proximity for optimal performance. Hard errors if topology discovery fails.
+ * Automatically discovers system topology using hwloc and maps GPUs to network devices
+ * based on PCIe proximity for optimal performance. Gracefully falls back to TCP/sockets
+ * when EFA devices are not available.
  */
 class nixlLibfabricTopology {
+public:
+    enum class DeviceType { EFA_DIRECT, EFA, TCP, SOCKETS, NONE };
+
 private:
-    // GPU to EFA device mapping: GPU 0→[efa0,efa1], GPU 1→[efa2,efa3], etc.
+    // GPU to network device mapping: GPU 0→[device0,device1], GPU 1→[device2,device3], etc.
     std::map<int, std::vector<std::string>> gpu_to_efa_devices;
 
-    // All available EFA devices discovered on this system
-    std::vector<std::string> all_efa_devices;
+    // All available network devices discovered on this system
+    std::vector<std::string> all_devices;
 
-    // EFA fabric name
-    std::string efa_fabric_name;
+    // Network fabric name (efa-direct, efa, tcp, sockets, etc.)
+    std::string fabric_name;
 
     // System information
     int num_gpus;
     int num_numa_nodes;
-    int num_efa_devices;
+    int num_devices;
 
     // Discovery state
     bool topology_discovered;
+    DeviceType discovered_device_type;
 
     // hwloc topology handle
     hwloc_topology_t hwloc_topology;
@@ -121,8 +126,15 @@ private:
     isEfaDevice(hwloc_obj_t obj) const;
 
 public:
-    nixlLibfabricTopology(); // Automatically discovers topology, throws on failure
+    nixlLibfabricTopology(); // Automatically discovers topology
     ~nixlLibfabricTopology();
+
+    // Status checking methods
+    DeviceType
+    getDeviceType() const {
+        return discovered_device_type;
+    }
+
     // GPU-based queries (main interface)
     std::vector<std::string>
     getEfaDevicesForGpu(int gpu_id) const;
@@ -134,13 +146,13 @@ public:
     }
 
     const std::vector<std::string> &
-    getAllEfaDevices() const {
-        return all_efa_devices;
+    getAllDevices() const {
+        return all_devices;
     }
 
     const std::string &
-    getEFAfabricName() const {
-        return efa_fabric_name;
+    getFabricName() const {
+        return fabric_name;
     }
 
     // Validation
@@ -152,7 +164,8 @@ public:
     bool
     isValidGpuId(int gpu_id) const;
     bool
-    isValidEfaDevice(const std::string &efa_device) const;
+    isValidDevice(const std::string &efa_device) const;
+
     // Debug/info
     void
     printTopologyInfo() const;

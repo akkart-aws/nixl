@@ -31,65 +31,102 @@ namespace LibfabricUtils {
 
 
 std::pair<std::string, std::vector<std::string>>
-getAvailableEfaDevices() {
-    std::unordered_map<std::string, std::vector<std::string>> provider_devices_map;
-    std::vector<std::string> all_efa_devices;
+getAvailableNetworkDevices() {
+    std::vector<std::string> all_devices;
     std::string fabric_name;
-    struct fi_info *hints, *info;
-    hints = fi_allocinfo();
-    if (!hints) {
-        NIXL_ERROR << "Failed to allocate fi_info for device discovery";
-        return {fabric_name, all_efa_devices};
-    }
 
-    // Important to initialize this to allow differentiation between EFA and EFA-Direct
-    hints->mode = ~0;
+    // Priority order: EFA-Direct > EFA > TCP > Sockets
+    std::vector<std::string> provider_priority = {"efa-direct", "efa", "tcp", "sockets"};
 
-    // Set required capabilities - let libfabric select the best provider
-    hints->caps = FI_READ | FI_WRITE | FI_RECV | FI_SEND | FI_REMOTE_READ | FI_REMOTE_WRITE |
-        FI_LOCAL_COMM | FI_REMOTE_COMM;
-    hints->fabric_attr->prov_name = strdup("efa");
-    hints->ep_attr->type = FI_EP_RDM;
+    for (const std::string &provider : provider_priority) {
+        NIXL_TRACE << "Trying provider: " << provider;
 
-    int ret = fi_getinfo(FI_VERSION(1, 9), NULL, NULL, 0, hints, &info);
-    if (ret) {
-        NIXL_ERROR << "fi_getinfo failed during device discovery: " << fi_strerror(-ret);
+        struct fi_info *hints, *info;
+        hints = fi_allocinfo();
+        if (!hints) {
+            NIXL_ERROR << "Failed to allocate fi_info for " << provider << " discovery";
+            continue;
+        }
+
+        // Configure hints based on provider capabilities
+        if (provider == "tcp" || provider == "sockets") {
+            // TCP/sockets providers use message endpoints and have different requirements
+            hints->mode = 0; // Let provider set appropriate mode
+            hints->caps = FI_MSG | FI_RMA; // Basic messaging and RMA
+            hints->ep_attr->type = FI_EP_MSG; // Message endpoint for TCP
+        } else {
+            // EFA providers use reliable datagram endpoints
+            hints->mode = 0;
+            hints->caps = FI_READ | FI_WRITE | FI_RECV | FI_SEND | FI_REMOTE_READ | FI_REMOTE_WRITE;
+            hints->ep_attr->type = FI_EP_RDM; // Reliable datagram for EFA
+        }
+
+        hints->fabric_attr->prov_name = strdup(provider.c_str());
+
+        int ret = fi_getinfo(FI_VERSION(1, 9), NULL, NULL, 0, hints, &info);
+        if (ret) {
+            NIXL_TRACE << "fi_getinfo failed for " << provider << ": " << fi_strerror(-ret);
+            fi_freeinfo(hints);
+            continue; // Try next provider
+        }
+
+        NIXL_TRACE << "fi_getinfo succeeded for " << provider << ", processing results...";
+
+        // Process devices for this provider
+        std::vector<std::string> provider_devices;
+        for (struct fi_info *cur = info; cur; cur = cur->next) {
+            if (cur->domain_attr && cur->domain_attr->name && cur->fabric_attr &&
+                cur->fabric_attr->name) {
+
+                std::string device_name = cur->domain_attr->name;
+                std::string fabric_name_returned = cur->fabric_attr->name;
+                std::string provider_name_returned =
+                    cur->fabric_attr->prov_name ? cur->fabric_attr->prov_name : "unknown";
+
+                NIXL_TRACE << "Found device - domain: " << device_name
+                           << ", fabric: " << fabric_name_returned
+                           << ", provider: " << provider_name_returned
+                           << ", ep_type: " << cur->ep_attr->type << ", caps: 0x" << std::hex
+                           << cur->caps << std::dec;
+
+                // Check if this matches the provider we're looking for
+                if (provider_name_returned == provider) {
+                    // For TCP provider, skip loopback devices
+                    if (provider == "tcp" && device_name == "lo") {
+                        NIXL_TRACE << "Skipping loopback device: " << device_name;
+                        continue;
+                    }
+
+                    provider_devices.push_back(device_name);
+                    NIXL_INFO << "Matched " << provider << " device: " << device_name
+                              << " (fabric: " << fabric_name_returned << ")";
+                }
+            }
+        }
+
+        fi_freeinfo(info);
         fi_freeinfo(hints);
-        return {fabric_name, all_efa_devices};
-    }
 
-    // Process providers and filter for EFA providers with RMA capabilities
-    for (struct fi_info *cur = info; cur; cur = cur->next) {
-        if (cur->domain_attr && cur->domain_attr->name && cur->fabric_attr &&
-            cur->fabric_attr->name) {
-
-            std::string device_name = cur->domain_attr->name;
-            std::string provider_name = cur->fabric_attr->name;
-
-            // Add device to the appropriate provider's vector
-            provider_devices_map[provider_name].push_back(device_name);
-
-            NIXL_TRACE << "Found EFA device: " << device_name << " with provider: " << provider_name
-                       << " (caps: 0x" << std::hex << cur->caps << std::dec << ")";
+        // If we found devices with this provider, use them
+        if (!provider_devices.empty()) {
+            // For TCP/sockets providers, just use the first device to keep it simple
+            if (provider == "tcp" || provider == "sockets") {
+                all_devices = {provider_devices[0]}; // Only use first device
+                NIXL_INFO << "Using " << provider
+                          << " provider with first device: " << provider_devices[0];
+            } else {
+                all_devices = provider_devices; // Use all devices for EFA
+                NIXL_INFO << "Using " << provider << " provider with " << all_devices.size()
+                          << " devices";
+            }
+            fabric_name = provider;
+            return {fabric_name, all_devices};
         }
     }
 
-    fi_freeinfo(info);
-    fi_freeinfo(hints);
-
-    // Extract device names from the map, prioritizing efa-direct over efa
-    all_efa_devices.clear();
-    if (provider_devices_map.find("efa-direct") != provider_devices_map.end()) {
-        all_efa_devices = provider_devices_map["efa-direct"];
-        fabric_name = "efa-direct";
-        NIXL_TRACE << "Using efa-direct provider with " << all_efa_devices.size() << " devices";
-    } else if (provider_devices_map.find("efa") != provider_devices_map.end()) {
-        all_efa_devices = provider_devices_map["efa"];
-        fabric_name = "efa";
-        NIXL_TRACE << "Using efa provider with " << all_efa_devices.size() << " devices";
-    }
-
-    return {fabric_name, all_efa_devices};
+    // No devices found with any provider
+    NIXL_WARN << "No network devices found with any provider";
+    return {"none", {}};
 }
 
 std::string

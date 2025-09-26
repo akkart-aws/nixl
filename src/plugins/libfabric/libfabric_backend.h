@@ -127,6 +127,13 @@ private:
     std::atomic<size_t> completed_requests_; // Atomic count of completed requests
     std::atomic<size_t> total_requests_used_; // Total number of requests for this transfer
 
+    // TCP notification handling fields
+    std::atomic<bool> notification_sent_{false}; // Flag to prevent duplicate notifications
+    std::string pending_notification_agent_; // Remote agent for pending notification
+    std::string pending_notification_message_; // Message for pending notification
+    bool has_pending_notification_{false}; // Whether there's a notification to send
+    bool is_tcp_provider_{false}; // Whether this transfer uses TCP provider
+
 public:
     nixlLibfabricBackendH();
     ~nixlLibfabricBackendH();
@@ -154,6 +161,46 @@ public:
     /** Adjust total request count to actual value after submissions complete */
     void
     adjust_total_requests(size_t actual_count);
+
+    // TCP notification methods
+    /** Atomically set notification as sent, returns true if we're the first to set it */
+    bool
+    trySetNotificationSent() {
+        return !notification_sent_.exchange(true);
+    }
+
+    /** Store notification details for later sending when transfer completes */
+    void
+    setPendingNotification(const std::string &agent, const std::string &message, bool is_tcp) {
+        pending_notification_agent_ = agent;
+        pending_notification_message_ = message;
+        has_pending_notification_ = true;
+        is_tcp_provider_ = is_tcp;
+    }
+
+    /** Check if there's a pending notification to send */
+    bool
+    hasPendingNotification() const {
+        return has_pending_notification_;
+    }
+
+    /** Check if this transfer uses TCP provider */
+    bool
+    isTcpProvider() const {
+        return is_tcp_provider_;
+    }
+
+    /** Get the remote agent for pending notification */
+    const std::string &
+    getPendingAgent() const {
+        return pending_notification_agent_;
+    }
+
+    /** Get the message for pending notification */
+    const std::string &
+    getPendingMessage() const {
+        return pending_notification_message_;
+    }
 };
 
 class nixlLibfabricEngine : public nixlBackendEngine {
@@ -579,6 +626,31 @@ public:
      */
     void
     checkPendingNotifications();
+
+    // TCP notification helper methods
+    /**
+     * @brief Check if connection uses TCP provider
+     *
+     * Determines if the connection to the specified remote agent uses
+     * TCP or sockets provider instead of EFA.
+     *
+     * @param[in] remote_agent Name of the remote agent to check
+     * @return true if using TCP/sockets provider, false if using EFA
+     */
+    bool
+    isUsingTcpProvider(const std::string &remote_agent) const;
+
+    /**
+     * @brief Send TCP notification when transfer completes
+     *
+     * Thread-safe method to send notification for TCP providers after
+     * all transfer requests have completed. Uses atomic flag to prevent
+     * duplicate notifications.
+     *
+     * @param[in] backend_handle Request handle with pending notification
+     */
+    void
+    sendTcpNotificationIfReady(nixlLibfabricBackendH *backend_handle) const;
 };
 
 #endif

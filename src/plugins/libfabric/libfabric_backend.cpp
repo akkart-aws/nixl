@@ -355,6 +355,7 @@ nixlLibfabricEngine::nixlLibfabricEngine(const nixlBackendInitParams *init_param
         }
     }
     catch (const std::exception &e) {
+        NIXL_ERROR << "Failed to initialize libfabric backend: " << e.what();
         cleanup();
         throw;
     }
@@ -768,6 +769,9 @@ nixlLibfabricEngine::registerMem(const nixlBlobDesc &mem,
 #endif
 
     // Use Rail Manager for centralized memory registration with GPU Direct RDMA support
+    NIXL_TRACE << "Registering memory: addr=" << (void *)mem.addr << " len=" << mem.len
+               << " mem_type=" << nixl_mem << " devId=" << mem.devId;
+
     nixl_status_t status = rail_manager.registerMemory((void *)mem.addr,
                                                        mem.len,
                                                        nixl_mem,
@@ -1075,21 +1079,30 @@ nixlLibfabricEngine::postXfer(const nixl_xfer_op_t &operation,
         backend_handle->adjust_total_requests(binary_notif->xfer_id_count);
     }
 
-    // Send notification immediately after successful request submission
+    // Handle notification based on provider type
     if (opt_args && opt_args->hasNotif) {
-        NIXL_DEBUG << "Sending immediate notification after successful request submission";
+        bool is_tcp = isUsingTcpProvider(remote_agent);
 
-        // Set agent name and message in the BinaryNotification
-        binary_notif->setAgentName(localAgent);
-        binary_notif->setMessage(opt_args->notifMsg);
+        if (is_tcp) {
+            // TCP provider: store notification for later sending when transfer completes
+            backend_handle->setPendingNotification(remote_agent, opt_args->notifMsg, true);
+            NIXL_DEBUG << "Stored TCP notification for later sending when transfer completes";
+        } else {
+            // EFA provider: send immediately with XFER_IDs (existing behavior)
+            NIXL_DEBUG << "Sending immediate EFA notification after successful request submission";
 
-        nixl_status_t notif_status = notifSendPriv(remote_agent, control_request);
-        if (notif_status != NIXL_SUCCESS) {
-            NIXL_ERROR << "Failed to send immediate notification";
-            return notif_status;
+            // Set agent name and message in the BinaryNotification
+            binary_notif->setAgentName(localAgent);
+            binary_notif->setMessage(opt_args->notifMsg);
+
+            nixl_status_t notif_status = notifSendPriv(remote_agent, control_request);
+            if (notif_status != NIXL_SUCCESS) {
+                NIXL_ERROR << "Failed to send immediate EFA notification";
+                return notif_status;
+            }
+            NIXL_DEBUG << "EFA notification sent immediately with " << binary_notif->xfer_id_count
+                       << " XFER_IDs";
         }
-        NIXL_DEBUG << "Immediate notification sent successfully with "
-                   << binary_notif->xfer_id_count << " XFER_IDs";
     }
 
     // Progress data rails to kick off transfers
@@ -1102,6 +1115,10 @@ nixlLibfabricEngine::postXfer(const nixl_xfer_op_t &operation,
 
     // For very small transfers we can check for local completions immediately.
     if (backend_handle->is_completed()) {
+        // Check if we need to send TCP notification
+        if (backend_handle->isTcpProvider()) {
+            sendTcpNotificationIfReady(backend_handle);
+        }
         return NIXL_SUCCESS;
     }
 
@@ -1121,6 +1138,10 @@ nixlLibfabricEngine::checkXfer(nixlBackendReqH *handle) const {
     }
     // Then check for completions after processing any pending completions
     if (backend_handle->is_completed()) {
+        // Check if we need to send TCP notification
+        if (backend_handle->isTcpProvider()) {
+            sendTcpNotificationIfReady(backend_handle);
+        }
         NIXL_DEBUG << "Data transfer completed successfully";
         return NIXL_SUCCESS;
     }
@@ -1548,6 +1569,52 @@ nixlLibfabricEngine::checkPendingNotifications() {
             ++it;
         }
     }
+}
+
+/****************************************
+ * TCP Notification Helper Methods
+ *****************************************/
+
+bool
+nixlLibfabricEngine::isUsingTcpProvider(const std::string &remote_agent) const {
+    // Check if any of the rails for this connection use TCP/sockets provider
+    // Since all rails should use the same provider, we can check the first data rail
+    if (rail_manager.getNumDataRails() == 0) {
+        return false; // No rails available
+    }
+
+    const std::string &provider_name = rail_manager.getDataRail(0).provider_name;
+    bool is_tcp = (provider_name == "tcp" || provider_name == "sockets");
+
+    NIXL_DEBUG << "Provider detection for agent " << remote_agent << ": provider=" << provider_name
+               << ", is_tcp=" << is_tcp;
+
+    return is_tcp;
+}
+
+void
+nixlLibfabricEngine::sendTcpNotificationIfReady(nixlLibfabricBackendH *backend_handle) const {
+    if (!backend_handle->hasPendingNotification()) {
+        return; // No notification to send
+    }
+
+    if (backend_handle->trySetNotificationSent()) {
+        // We're the first thread to detect completion - send notification without XFER_IDs
+        NIXL_DEBUG << "Sending TCP notification after transfer completion to agent: "
+                   << backend_handle->getPendingAgent();
+
+        // Use genNotif() which sends notification without XFER_IDs
+        nixl_status_t status =
+            genNotif(backend_handle->getPendingAgent(), backend_handle->getPendingMessage());
+        if (status != NIXL_SUCCESS) {
+            NIXL_ERROR << "Failed to send TCP notification after completion: " << status;
+        } else {
+            NIXL_DEBUG << "TCP notification sent successfully after transfer completion";
+        }
+    } else {
+        NIXL_TRACE << "TCP notification already sent by another thread";
+    }
+    // If trySetNotificationSent() returned false, another thread already sent it
 }
 
 void
