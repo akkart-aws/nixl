@@ -405,6 +405,11 @@ nixlLibfabricRailManager::registerMemory(void *buffer,
         return NIXL_ERR_NOT_SUPPORTED;
     }
 
+    enum fi_hmem_iface iface = FI_HMEM_SYSTEM;
+    if (mem_type == VRAM_SEG) {
+        iface = topology->getMrAttrIface(gpu_id);
+    }
+
     // Resize output vectors to match all rails
     mr_list_out.resize(data_rails_.size(), nullptr);
     key_list_out.clear();
@@ -430,7 +435,7 @@ nixlLibfabricRailManager::registerMemory(void *buffer,
         struct fid_mr *mr;
         uint64_t key;
         nixl_status_t status =
-            data_rails_[rail_idx]->registerMemory(buffer, length, mem_type, gpu_id, &mr, &key);
+            data_rails_[rail_idx]->registerMemory(buffer, length, mem_type, gpu_id, iface, &mr, &key);
         if (status != NIXL_SUCCESS) {
             NIXL_ERROR << "Failed to register memory on rail " << rail_idx;
             // Cleanup already registered MRs

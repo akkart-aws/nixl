@@ -34,12 +34,20 @@
 
 nixlLibfabricTopology::nixlLibfabricTopology()
     : num_gpus(0),
+      num_nvidia_gpus(0),
       num_numa_nodes(0),
       num_devices(0),
+      gpu_id_shift(0),
       topology_discovered(false),
       hwloc_topology(nullptr) {
 
     NIXL_TRACE << "Starting automatic topology discovery";
+
+    // Discover AWS instance type, if available.
+    std::ifstream instance_type_file("/sys/devices/virtual/dmi/id/product_name");
+    if (instance_type_file) {
+        std::getline(instance_type_file, instance_type);
+    }
 
     // Discover topology immediately - hard error if it fails
     nixl_status_t status = discoverTopology();
@@ -136,7 +144,7 @@ nixlLibfabricTopology::discoverEfaDevices() {
 
 std::vector<std::string>
 nixlLibfabricTopology::getEfaDevicesForGpu(int gpu_id) const {
-    auto it = gpu_to_efa_devices.find(gpu_id);
+    auto it = gpu_to_efa_devices.find(gpu_id >> gpu_id_shift);
     if (it != gpu_to_efa_devices.end()) {
         return it->second;
     }
@@ -146,6 +154,7 @@ nixlLibfabricTopology::getEfaDevicesForGpu(int gpu_id) const {
 
 bool
 nixlLibfabricTopology::isValidGpuId(int gpu_id) const {
+    gpu_id >>= gpu_id_shift;
     return gpu_id >= 0 && gpu_id < num_gpus;
 }
 
@@ -296,28 +305,33 @@ nixlLibfabricTopology::discoverHwlocTopology() {
 nixl_status_t
 nixlLibfabricTopology::discoverGpusWithHwloc() {
     num_gpus = 0;
+    num_nvidia_gpus = 0;
     // Find all PCI devices and log detailed information
+    static const char* vendor_names[2] = { "NEURON", "NVIDIA" };
     hwloc_obj_t pci_obj = nullptr;
     while ((pci_obj = hwloc_get_next_pcidev(hwloc_topology, pci_obj)) != nullptr) {
-        if (isNvidiaGpu(pci_obj)) {
+        const bool is_nvidia_gpu = isNvidiaGpu(pci_obj);
+        if (is_nvidia_gpu || isNeuronGpu(pci_obj)) {
             std::string pcie_addr = getPcieAddressFromHwlocObj(pci_obj);
             // Get device and vendor info
             uint16_t vendor_id = pci_obj->attr->pcidev.vendor_id;
             uint16_t device_id = pci_obj->attr->pcidev.device_id;
             uint16_t class_id = pci_obj->attr->pcidev.class_id;
 
-            NIXL_TRACE << "Found NVIDIA GPU " << num_gpus << ": " << pcie_addr
+            NIXL_TRACE << "Found " << vendor_names[is_nvidia_gpu] << " GPU " << num_gpus << ": " << pcie_addr
                        << " (vendor=" << std::hex << vendor_id << ", device=" << device_id
                        << ", class=" << class_id << std::dec << ")";
 
             num_gpus++;
+            num_nvidia_gpus += is_nvidia_gpu;
         }
     }
 
-    NIXL_TRACE << "Discovered " << num_gpus << " NVIDIA GPUs via hwloc";
+    NIXL_TRACE << "Discovered " << num_gpus << " "
+               << vendor_names[num_gpus == num_nvidia_gpus] << " GPUs via hwloc";
 
     // If we found more than 8 GPUs on P5en, investigate further
-    if (num_gpus > 8) {
+    if (num_nvidia_gpus > 8) {
         NIXL_WARN << "Found " << num_gpus
                   << " NVIDIA GPUs, but P5en should have 8. Investigating...";
 
@@ -424,8 +438,16 @@ nixlLibfabricTopology::buildPcieToLibfabricMapping() {
 nixl_status_t
 nixlLibfabricTopology::buildGpuToEfaMapping() {
     gpu_to_efa_devices.clear();
-    // Implement NIXL's topology-aware GPU-EFA grouping algorithm
-    nixl_status_t status = buildTopologyAwareGrouping();
+
+    nixl_status_t status;
+    if (instance_type.compare(0, 3, "trn", 3) == 0 ||
+        instance_type.compare(0, 3, "inf", 3) == 0) {
+        // For trn and inf instance types, use static mappings.
+        status = buildStaticNeuronGrouping();
+    } else {
+        // Implement NIXL's topology-aware GPU-EFA grouping algorithm
+        status = buildTopologyAwareGrouping();
+    }
     if (status != NIXL_SUCCESS) {
         NIXL_WARN << "Topology-aware grouping failed, using fallback to use all available devices";
         return buildFallbackMapping();
@@ -434,6 +456,108 @@ nixlLibfabricTopology::buildGpuToEfaMapping() {
     NIXL_TRACE << "Built GPU→EFA mapping for " << gpu_to_efa_devices.size()
                << " GPUs using topology-aware algorithm";
 
+    return NIXL_SUCCESS;
+}
+
+nixl_status_t
+nixlLibfabricTopology::buildStaticNeuronGrouping() {
+    static const char *const trn2_seng_nic_mapping[16] = {
+        "0:c9:00.0", // RID  0
+        "0:ca:00.0", // RID  1
+        "0:6c:00.0", // RID  2
+        "0:6d:00.0", // RID  3
+        "0:f5:00.0", // RID  4
+        "0:f6:00.0", // RID  5
+        "0:98:00.0", // RID  6
+        "0:99:00.0", // RID  7
+        "0:b4:00.0", // RID  8
+        "0:b3:00.0", // RID  9
+        "0:57:00.0", // RID 10
+        "0:56:00.0", // RID 11
+        "0:e0:00.0", // RID 12
+        "0:df:00.0", // RID 13
+        "0:83:00.0", // RID 14
+        "0:82:00.0"  // RID 15
+    };
+    static const int trn2_nd_to_rid_mapping[16] = {
+        0, 8, 9, 1, 2, 10, 11, 3, 6, 14, 15, 7, 4, 12, 13, 5
+    };
+    static const char *const trn1_seng_nic_mapping[16] = {
+        "0:10:1a.0", // RID  0
+        "0:20:19.0", // RID  1
+        "0:10:1a.0", // RID  2
+        "0:20:19.0", // RID  3
+        "0:a0:1a.0", // RID  4
+        "0:90:19.0", // RID  5
+        "0:a0:1a.0", // RID  6
+        "0:90:19.0", // RID  7
+        "0:10:19.0", // RID  8
+        "0:20:1a.0", // RID  9
+        "0:10:19.0", // RID 10
+        "0:20:1a.0", // RID 11
+        "0:a0:19.0", // RID 12
+        "0:90:1a.0", // RID 13
+        "0:a0:19.0", // RID 14
+        "0:90:1a.0"  // RID 15
+    };
+    static const char *const trn1n_seng_nic_mapping[16] = {
+        "0:10:17.0", // RID  0
+        "0:20:19.0", // RID  1
+        "0:10:1a.0", // RID  2
+        "0:20:18.0", // RID  3
+        "0:a0:1a.0", // RID  4
+        "0:90:18.0", // RID  5
+        "0:a0:17.0", // RID  6
+        "0:90:19.0", // RID  7
+        "0:10:19.0", // RID  8
+        "0:20:17.0", // RID  9
+        "0:10:18.0", // RID 10
+        "0:20:1a.0", // RID 11
+        "0:a0:18.0", // RID 12
+        "0:90:1a.0", // RID 13
+        "0:a0:19.0", // RID 14
+        "0:90:17.0", // RID 15
+    };
+    static const int trn1_nd_to_rid_mapping[16] = {
+        0, 2, 6, 4, 1, 3, 7, 5, 9, 11, 15, 13, 8, 10, 14, 12
+    };
+    int num_nds = 0;
+    const int *rid_mapping = nullptr;
+    const char *const *nic_mapping = nullptr;
+
+    auto instance_type_startswith = [this](const std::string& prefix) {
+        return instance_type.compare(0, prefix.size(), prefix) == 0;
+    };
+    if (instance_type_startswith("trn2")) {
+        num_nds = std::size(trn2_nd_to_rid_mapping);
+        rid_mapping = trn2_nd_to_rid_mapping;
+        nic_mapping = trn2_seng_nic_mapping;
+        gpu_id_shift = 2;
+    } else if (instance_type_startswith("trn1")) {
+        num_nds = std::size(trn1_nd_to_rid_mapping);
+        rid_mapping = trn1_nd_to_rid_mapping;
+        if (instance_type_startswith("trn1n")) {
+          nic_mapping = trn1n_seng_nic_mapping;
+        } else {
+          nic_mapping = trn1_seng_nic_mapping;
+        }
+        gpu_id_shift = 1;
+    } else {
+        NIXL_ERROR << "Unknown instnace type: " << instance_type;
+        return NIXL_ERR_BACKEND;
+    }
+
+    for (int id = 0; id < num_nds; ++id) {
+        const char *nic_bdf = nic_mapping[rid_mapping[id]];
+        auto it = pcie_to_libfabric_map.find(nic_bdf);
+        if (it != pcie_to_libfabric_map.end()) {
+            gpu_to_efa_devices[id].push_back(it->second);
+        } else {
+            NIXL_ERROR << "Could out find required NIC for ND[" << id
+                       << "] at PCIe address: " << nic_bdf;
+            return NIXL_ERR_BACKEND;
+        }
+    }
     return NIXL_SUCCESS;
 }
 
@@ -583,6 +707,27 @@ nixlLibfabricTopology::isNvidiaGpu(hwloc_obj_t obj) const {
     // Class 0x302 is 3D controller (GPU), 0x680 is other devices (network, etc.)
     uint16_t class_id = obj->attr->pcidev.class_id;
     return (class_id >= 0x300 && class_id < 0x400);
+}
+
+bool
+nixlLibfabricTopology::isNeuronGpu(hwloc_obj_t obj) const {
+    if (!obj || obj->type != HWLOC_OBJ_PCI_DEVICE) {
+        return false;
+    }
+    // Amazon vendor ID is 0x1d0f
+    if (obj->attr->pcidev.vendor_id != 0x1d0f) {
+        return false;
+    }
+    static const uint16_t NEURON_DEVICE_IDS[] = {
+      0x7264,  // INF2
+      0x7164,  // TRN1
+      0x7364,  // TRN2
+      0x7564,  // TRN3_DEVICE_0
+      0x7565,  // TRN3_DEVICE_1
+    };
+    return std::find(std::begin(NEURON_DEVICE_IDS),
+                     std::end(NEURON_DEVICE_IDS),
+                     obj->attr->pcidev.device_id) != std::end(NEURON_DEVICE_IDS);
 }
 
 bool

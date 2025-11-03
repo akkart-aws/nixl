@@ -28,6 +28,7 @@
 #include <numeric>
 
 #include "absl/strings/numbers.h"
+#include "libfabric/libfabric_topology.h"
 
 #ifdef HAVE_CUDA
 // CUDA error checking macros
@@ -736,7 +737,8 @@ nixlLibfabricEngine::registerMem(const nixlBlobDesc &mem,
 
 #ifdef HAVE_CUDA
     // Handle CUDA memory registration with GPU Direct RDMA support
-    if (nixl_mem == VRAM_SEG) {
+    if (nixl_mem == VRAM_SEG &&
+        rail_manager.getTopology()->getMrAttrIface(mem.devId) == FI_HMEM_CUDA) {
         // For multi-GPU support, skip CUDA address workaround
         if (cuda_addr_wa_) {
             bool need_restart;
@@ -770,7 +772,8 @@ nixlLibfabricEngine::registerMem(const nixlBlobDesc &mem,
 
 #ifdef HAVE_CUDA
     // Set CUDA context before libfabric operations for VRAM
-    if (nixl_mem == VRAM_SEG) {
+    if (nixl_mem == VRAM_SEG &&
+        rail_manager.getTopology()->getMrAttrIface(mem.devId) == FI_HMEM_CUDA) {
         vramApplyCtx();
     }
 #endif
