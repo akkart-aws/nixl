@@ -43,8 +43,16 @@ private:
 
     // System information
     int num_gpus;
+    int num_nvidia_gpus;
     int num_numa_nodes;
     int num_devices;
+
+    // AWS instance type
+    std::string instance_type;
+
+    // For NEURON, there can be multiple accelerators behind a single PCI device.
+    // Right shift the gpu_id by this amount to get to the physical GPU id.
+    int gpu_id_shift;
 
     // Discovery state
     bool topology_discovered;
@@ -105,6 +113,8 @@ private:
 
     // NIXL topology-aware grouping algorithm methods
     nixl_status_t
+    buildStaticNeuronGrouping();
+    nixl_status_t
     buildTopologyAwareGrouping();
     nixl_status_t
     buildFallbackMapping();
@@ -119,6 +129,8 @@ private:
     bool
     isNvidiaGpu(hwloc_obj_t obj) const;
     bool
+    isNeuronGpu(hwloc_obj_t obj) const;
+    bool
     isEfaDevice(hwloc_obj_t obj) const;
 
 public:
@@ -132,7 +144,7 @@ public:
     // System information
     int
     getNumGpus() const {
-        return num_gpus;
+        return num_gpus << gpu_id_shift;
     }
 
     const std::vector<std::string> &
@@ -155,6 +167,10 @@ public:
     isValidGpuId(int gpu_id) const;
     bool
     isValidDevice(const std::string &efa_device) const;
+
+    enum fi_hmem_iface getMrAttrIface(int gpu_id) const {
+        return (gpu_id < num_nvidia_gpus) ? FI_HMEM_CUDA : FI_HMEM_NEURON;
+    }
 
     // Debug/info
     void
