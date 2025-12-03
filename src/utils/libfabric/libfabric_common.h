@@ -34,7 +34,10 @@
 
 // Libfabric configuration constants
 #define NIXL_LIBFABRIC_DEFAULT_CONTROL_RAILS 1
-#define NIXL_LIBFABRIC_CQ_SREAD_TIMEOUT_MS 1000
+
+// Short timeout required for sockets provider to maintain progress during connection establishment.
+// Longer timeouts (e.g., 1000ms) cause deadlock as CM thread blocks in poll(), preventing message processing.
+#define NIXL_LIBFABRIC_CQ_SREAD_TIMEOUT_MS 10
 #define NIXL_LIBFABRIC_DEFAULT_STRIPING_THRESHOLD (128 * 1024) // 128KB
 #define LF_EP_NAME_MAX_LEN 56
 
