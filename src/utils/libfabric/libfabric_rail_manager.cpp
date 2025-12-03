@@ -22,6 +22,93 @@
 #include "common/nixl_log.h"
 #include "serdes/serdes.h"
 
+#ifdef HAVE_CUDA
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+// Helper function to get physical GPU ID from PCI bus ID
+// Maps PCI bus IDs to physical GPU indices based on known P5en topology
+static int getPhysicalGpuIdFromPciBusId(const char* pci_bus_id) {
+    // P5en.48xlarge GPU topology (8 GPUs):
+    // GPU 0: 0000:59:00.0, GPU 1: 0000:5A:00.0
+    // GPU 2: 0000:72:00.0, GPU 3: 0000:73:00.0
+    // GPU 4: 0000:8B:00.0, GPU 5: 0000:8C:00.0
+    // GPU 6: 0000:A4:00.0, GPU 7: 0000:A5:00.0
+    
+    struct PciBusMapping {
+        const char* pci_bus;
+        int physical_gpu_id;
+    };
+    
+    static const PciBusMapping mappings[] = {
+        {"0000:59:00.0", 0}, {"0000:5A:00.0", 1},
+        {"0000:72:00.0", 2}, {"0000:73:00.0", 3},
+        {"0000:8B:00.0", 4}, {"0000:8C:00.0", 5},
+        {"0000:A4:00.0", 6}, {"0000:A5:00.0", 7}
+    };
+    
+    for (const auto& mapping : mappings) {
+        if (strcmp(pci_bus_id, mapping.pci_bus) == 0) {
+            return mapping.physical_gpu_id;
+        }
+    }
+    
+    return -1; // Not found
+}
+
+// Helper function to get physical GPU ID from memory address
+static int getPhysicalGpuIdFromMemory(void* gpu_memory) {
+    bool is_dev;
+    CUdevice app_device;  // Application-visible device ordinal
+    CUcontext ctx;
+    CUmemorytype mem_type = CU_MEMORYTYPE_HOST;
+    uint32_t is_managed = 0;
+    CUpointer_attribute attr_type[4];
+    void *attr_data[4];
+
+    attr_type[0] = CU_POINTER_ATTRIBUTE_MEMORY_TYPE;
+    attr_data[0] = &mem_type;
+    attr_type[1] = CU_POINTER_ATTRIBUTE_IS_MANAGED;
+    attr_data[1] = &is_managed;
+    attr_type[2] = CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL;
+    attr_data[2] = &app_device;
+    attr_type[3] = CU_POINTER_ATTRIBUTE_CONTEXT;
+    attr_data[3] = &ctx;
+
+    CUresult result = cuPointerGetAttributes(4, attr_type, attr_data, (CUdeviceptr)gpu_memory);
+    is_dev = (mem_type == CU_MEMORYTYPE_DEVICE);
+    
+    if (result != CUDA_SUCCESS || !is_dev) {
+        NIXL_WARN << "Failed to query device from memory " << gpu_memory 
+                  << " (result=" << result << ", is_dev=" << is_dev << ")";
+        return -1; // Error - use fallback
+    }
+    
+    // app_device is the application-visible device ordinal (affected by CUDA_VISIBLE_DEVICES)
+    // Get PCI bus ID from the application device to map to physical GPU
+    char pci_bus_id[32];
+    result = cuDeviceGetPCIBusId(pci_bus_id, sizeof(pci_bus_id), app_device);
+    if (result != CUDA_SUCCESS) {
+        NIXL_WARN << "Failed to get PCI bus ID for app device " << (int)app_device;
+        return -1;
+    }
+    
+    // Map PCI bus ID to physical GPU ID using known P5en topology
+    int physical_gpu_id = getPhysicalGpuIdFromPciBusId(pci_bus_id);
+    
+    if (physical_gpu_id >= 0) {
+        NIXL_INFO << "Physical GPU ID query: memory=" << gpu_memory 
+                  << " app_device=" << (int)app_device
+                  << " pci_bus_id=" << pci_bus_id
+                  << " -> physical_device=" << physical_gpu_id;
+        return physical_gpu_id;
+    }
+    
+    NIXL_WARN << "Could not map PCI bus ID " << pci_bus_id << " to physical GPU ID";
+    return -1; // Error - use fallback
+}
+#endif
+
 // Forward declaration for LibfabricUtils namespace
 namespace LibfabricUtils {
 uint16_t
@@ -46,6 +133,11 @@ nixlLibfabricRailManager::nixlLibfabricRailManager(size_t striping_threshold)
 
     // Get network devices from topology and create rails automatically
     std::vector<std::string> all_devices = topology->getAllDevices();
+    // std::vector<std::string> selected_devices;
+    // for (uint32_t idx = 0; idx < 4; idx++) {
+    //     selected_devices.push_back(all_devices[idx]);
+    // }
+
     std::string selected_provider_name = topology->getProviderName();
 
     NIXL_DEBUG << "Got " << all_devices.size()
@@ -398,8 +490,24 @@ nixlLibfabricRailManager::registerMemory(void *buffer,
         return NIXL_ERR_INVALID_PARAM;
     }
 
-    // Use internal rail selection with explicit GPU ID
-    std::vector<size_t> selected_rails = selectRailsForMemory(buffer, mem_type, gpu_id);
+#ifdef HAVE_CUDA
+    // FIX: Get physical GPU ID for EFA device selection
+    int physical_gpu_id = gpu_id; // Default fallback
+    if (mem_type == VRAM_SEG) {
+        int queried_gpu_id = getPhysicalGpuIdFromMemory(buffer);
+        if (queried_gpu_id >= 0) {
+            physical_gpu_id = queried_gpu_id;
+            NIXL_INFO << "Using physical GPU ID " << physical_gpu_id << " for EFA device selection (was: " << gpu_id << ")";
+        } else {
+            NIXL_WARN << "Failed to query physical GPU ID, using fallback " << gpu_id << " for EFA device selection";
+        }
+    }
+#else
+    int physical_gpu_id = gpu_id;
+#endif
+
+    // FIX: Use physical GPU ID for EFA device selection via topology
+    std::vector<size_t> selected_rails = selectRailsForMemory(buffer, mem_type, physical_gpu_id);
     if (selected_rails.empty()) {
         NIXL_ERROR << "No rails selected for memory type " << mem_type;
         return NIXL_ERR_NOT_SUPPORTED;
@@ -429,8 +537,9 @@ nixlLibfabricRailManager::registerMemory(void *buffer,
 
         struct fid_mr *mr;
         uint64_t key;
+        // FIX: Pass physical GPU ID to individual rail registerMemory calls
         nixl_status_t status =
-            data_rails_[rail_idx]->registerMemory(buffer, length, mem_type, gpu_id, &mr, &key);
+            data_rails_[rail_idx]->registerMemory(buffer, length, mem_type, physical_gpu_id, &mr, &key);
         if (status != NIXL_SUCCESS) {
             NIXL_ERROR << "Failed to register memory on rail " << rail_idx;
             // Cleanup already registered MRs

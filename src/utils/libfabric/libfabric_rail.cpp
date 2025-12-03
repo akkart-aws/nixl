@@ -514,6 +514,7 @@ nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
         }
 
         // Create endpoint for this rail
+        // info->mode |= FI_RX_CQ_DATA;
         ret = fi_endpoint(domain, info, &endpoint, NULL);
         if (ret) {
             NIXL_ERROR << "fi_endpoint failed for rail " << rail_id << ": " << fi_strerror(-ret);
@@ -803,7 +804,7 @@ nixlLibfabricRail::processCompletionQueueEntry(struct fi_cq_data_entry *comp) co
                   << " FI_WRITE=" << !!(flags & FI_WRITE) << " FI_READ=" << !!(flags & FI_READ)
                   << " FI_REMOTE_WRITE=" << !!(flags & FI_REMOTE_WRITE)
                   << " FI_REMOTE_READ=" << !!(flags & FI_REMOTE_READ) << ")"
-                  << " data=" << comp->data << " context=" << comp->op_context
+                  << " data=" << std::hex << comp->data << " context=" << comp->op_context
                   << " len=" << comp->len;
 
         // Try to find the request associated with this context for debugging
