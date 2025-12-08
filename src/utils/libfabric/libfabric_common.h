@@ -33,6 +33,14 @@
 #include <rdma/fi_cm.h>
 #include <rdma/fi_rma.h>
 
+// Check if FI_OPT_EFA_USE_UNSOLICITED_WRITE_RECV is available
+#if defined(FI_MAJOR_VERSION) && defined(FI_MINOR_VERSION)
+// Available in libfabric >= 2.3
+#if (FI_MAJOR_VERSION >= 2 && FI_MINOR_VERSION >= 3)
+#define HAVE_FI_OPT_EFA_USE_UNSOLICITED_WRITE_RECV 1
+#endif
+#endif
+
 // Libfabric configuration constants
 #define NIXL_LIBFABRIC_DEFAULT_CONTROL_RAILS 1
 #define NIXL_LIBFABRIC_CQ_SREAD_TIMEOUT_MS 1000
