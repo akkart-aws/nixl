@@ -44,6 +44,7 @@ class xferBenchRT {
         virtual int sendChar(char *buffer, size_t count, int dest_rank) = 0;
         virtual int recvChar(char *buffer, size_t count, int src_rank) = 0;
         virtual int reduceSumDouble(double *local_value, double *global_value, int dest_rank) = 0;
+        virtual int gatherDouble(double *sendbuf, double *recvbuf, int root) = 0;
 
         // Add a barrier function to synchronize all processes
         virtual int barrier(const std::string& barrier_id) = 0;

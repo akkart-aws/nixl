@@ -498,3 +498,60 @@ int xferBenchEtcdRT::broadcastInt(int* buffer, size_t count, int root_rank) {
         return -1;
     }
 }
+
+int xferBenchEtcdRT::gatherDouble(double *sendbuf, double *recvbuf, int root) {
+    try {
+        std::string gather_key = makeKey("gather/root-" + std::to_string(root));
+        std::string value_key = gather_key + "/rank-" + std::to_string(my_rank);
+        
+        // All processes contribute their value
+        std::stringstream ss;
+        ss << std::fixed << std::setprecision(16) << *sendbuf;
+        client->put(value_key, ss.str());
+        
+        // Root process collects all values
+        if (my_rank == root) {
+            int collected = 0;
+            int expected = global_size / 2; // Only initiators in pairwise scheme
+            int retries = 0;
+            
+            while (collected < expected && should_retry(retries, 30)) {
+                auto response = client->ls(gather_key);
+                if (response.error_code() == 0) {
+                    for (const auto &key : response.keys()) {
+                        // Extract rank from key: "/rank-X"
+                        size_t pos = key.find("/rank-");
+                        if (pos != std::string::npos) {
+                            int rank = std::stoi(key.substr(pos + 6));
+                            if (rank < expected) {
+                                auto get_response = client->get(key);
+                                if (get_response.error_code() == 0) {
+                                    recvbuf[rank] = std::stod(get_response.value().as_string());
+                                    collected++;
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                if (collected < expected) {
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                    retries++;
+                }
+            }
+            
+            // Cleanup
+            client->rmdir(gather_key, true);
+            
+            if (collected < expected) {
+                std::cerr << "Gather timeout: got " << collected << "/" << expected << std::endl;
+                return -1;
+            }
+        }
+        
+        return 0;
+    } catch (const std::exception& e) {
+        std::cerr << "Error in gather: " << e.what() << std::endl;
+        return -1;
+    }
+}

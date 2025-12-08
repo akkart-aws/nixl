@@ -63,6 +63,14 @@ public:
     }
 
     virtual int
+    gatherDouble(double *sendbuf, double *recvbuf, int root) override {
+        if (root == 0) {
+            recvbuf[0] = *sendbuf;
+        }
+        return 0;
+    }
+
+    virtual int
     barrier(const std::string &barrier_id) override {
         return 0;
     }

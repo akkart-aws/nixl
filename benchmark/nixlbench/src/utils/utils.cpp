@@ -813,12 +813,17 @@ void xferBenchUtils::checkConsistency(std::vector<std::vector<xferBenchIOV>> &io
 void
 xferBenchUtils::printStatsHeader() {
     if (IS_PAIRWISE_AND_SG() && rt->getSize() > 2) {
-        // clang-format off
+        int num_initiators = rt->getSize() / 2;
         std::cout << std::left
                   << std::setw(20) << "Block Size (B)"
-                  << std::setw(15) << "Batch Size"
-                  << std::setw(15) << "B/W (GB/Sec)"
-                  << std::setw(25) << "Aggregate B/W (GB/Sec)"
+                  << std::setw(15) << "Batch Size";
+        
+        // Print individual device headers
+        for (int i = 0; i < num_initiators; i++) {
+            std::cout << std::setw(12) << ("Dev" + std::to_string(i) + " BW");
+        }
+        
+        std::cout << std::setw(25) << "Aggregate B/W (GB/Sec)"
                   << std::setw(20) << "Network Util (%)"
                   << std::setw(15) << "Avg Lat. (us)"
                   << std::setw(15) << "Avg Prep (us)"
@@ -828,9 +833,7 @@ xferBenchUtils::printStatsHeader() {
                   << std::setw(15) << "Avg Tx (us)"
                   << std::setw(15) << "P99 Tx (us)"
                   << std::endl;
-        // clang-format on
     } else {
-        // clang-format off
         std::cout << std::left
                   << std::setw(20) << "Block Size (B)"
                   << std::setw(15) << "Batch Size"
@@ -843,7 +846,6 @@ xferBenchUtils::printStatsHeader() {
                   << std::setw(15) << "Avg Tx (us)"
                   << std::setw(15) << "P99 Tx (us)"
                   << std::endl;
-        // clang-format on
     }
     xferBenchConfig::printSeparator('-');
 }
@@ -884,43 +886,51 @@ xferBenchUtils::printStats(bool is_target,
                    (total_duration / 1e6));   // In GB/Sec
 
     if (IS_PAIRWISE_AND_SG() && rt->getSize() > 2) {
+        // Gather all individual throughputs
+        int num_initiators = rt->getSize() / 2;
+        std::vector<double> all_throughputs(num_initiators);
+        rt->gatherDouble(&throughput_gb, all_throughputs.data(), 0);
         rt->reduceSumDouble(&throughput_gb, &totalbw, 0);
+        
+        // Only rank 0 prints the combined results
+        if (rt->getRank() == 0) {
+            double prepare_duration = stats.prepare_duration.avg();
+            double prepare_p99_duration = stats.prepare_duration.p99();
+            double post_duration = stats.post_duration.avg();
+            double post_p99_duration = stats.post_duration.p99();
+            double transfer_duration = stats.transfer_duration.avg();
+            double transfer_p99_duration = stats.transfer_duration.p99();
+
+            std::cout << std::left << std::fixed << std::setprecision(6)
+                      << std::setw(20) << block_size
+                      << std::setw(15) << batch_size;
+            
+            // Print individual device throughputs
+            for (int i = 0; i < num_initiators; i++) {
+                std::cout << std::setw(12) << all_throughputs[i];
+            }
+            
+            std::cout << std::setw(25) << totalbw
+                      << std::setw(20) << (totalbw / (rt->getSize() / 2 * MAXBW)) * 100
+                      << std::setprecision(1)
+                      << std::setw(15) << avg_latency
+                      << std::setw(15) << prepare_duration
+                      << std::setw(15) << prepare_p99_duration
+                      << std::setw(15) << post_duration
+                      << std::setw(15) << post_p99_duration
+                      << std::setw(15) << transfer_duration
+                      << std::setw(15) << transfer_p99_duration
+                      << std::endl;
+        }
     } else {
         totalbw = throughput_gb;
-    }
+        double prepare_duration = stats.prepare_duration.avg();
+        double prepare_p99_duration = stats.prepare_duration.p99();
+        double post_duration = stats.post_duration.avg();
+        double post_p99_duration = stats.post_duration.p99();
+        double transfer_duration = stats.transfer_duration.avg();
+        double transfer_p99_duration = stats.transfer_duration.p99();
 
-    if (IS_PAIRWISE_AND_SG() && rt->getRank() != 0) {
-        return;
-    }
-
-    double prepare_duration = stats.prepare_duration.avg();
-    double prepare_p99_duration = stats.prepare_duration.p99();
-    double post_duration = stats.post_duration.avg();
-    double post_p99_duration = stats.post_duration.p99();
-    double transfer_duration = stats.transfer_duration.avg();
-    double transfer_p99_duration = stats.transfer_duration.p99();
-
-    // Tabulate print with fixed width for each string
-    if (IS_PAIRWISE_AND_SG() && rt->getSize() > 2) {
-        // clang-format off
-        std::cout << std::left << std::fixed << std::setprecision(6)
-                  << std::setw(20) << block_size
-                  << std::setw(15) << batch_size
-                  << std::setw(15) << throughput_gb
-                  << std::setw(25) << totalbw
-                  << std::setw(20) << (totalbw / (rt->getSize() / 2 * MAXBW)) * 100
-                  << std::setprecision(1)
-                  << std::setw(15) << avg_latency
-                  << std::setw(15) << prepare_duration
-                  << std::setw(15) << prepare_p99_duration
-                  << std::setw(15) << post_duration
-                  << std::setw(15) << post_p99_duration
-                  << std::setw(15) << transfer_duration
-                  << std::setw(15) << transfer_p99_duration
-                  << std::endl;
-        // clang-format on
-    } else {
-        // clang-format off
         std::cout << std::left << std::fixed << std::setprecision(6)
                   << std::setw(20) << block_size
                   << std::setw(15) << batch_size
@@ -934,7 +944,6 @@ xferBenchUtils::printStats(bool is_target,
                   << std::setw(15) << transfer_duration
                   << std::setw(15) << transfer_p99_duration
                   << std::endl;
-        // clang-format on
     }
 }
 

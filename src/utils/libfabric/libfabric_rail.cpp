@@ -533,7 +533,7 @@ nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
             throw std::runtime_error("fi_ep_bind av failed for rail " + std::to_string(rail_id));
         }
 
-#ifdef FI_OPT_EFA_USE_UNSOLICITED_WRITE_RECV
+// #ifdef FI_OPT_EFA_USE_UNSOLICITED_WRITE_RECV
         // Disable unsolicited write recv for EFA RDM to reduce CQ overflow likelihood
         const bool use_unsolicited_write_recv = false; // Set to false to disable the feature
         ret = fi_setopt(&endpoint->fid,
@@ -550,7 +550,7 @@ nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
             NIXL_DEBUG << "FI_OPT_EFA_USE_UNSOLICITED_WRITE_RECV not supported for rail " << rail_id
                        << " (provider: " << provider_name << ") - skipping";
         }
-#endif
+// #endif
 
         // Disable shared memory transfers for EFA provider to fix same-agent transfers
         bool optval = false;

@@ -90,6 +90,7 @@ public:
     int recvChar(char *buffer, size_t count, int src_rank) override;
 
     int reduceSumDouble(double *local_value, double *global_value, int dest_rank) override;
+    int gatherDouble(double *sendbuf, double *recvbuf, int root) override;
 
     // Barrier synchronization
     int barrier(const std::string& barrier_id) override;
