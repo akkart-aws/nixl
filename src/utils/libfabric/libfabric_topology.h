@@ -47,9 +47,6 @@ private:
     int num_numa_nodes;
     int num_devices;
 
-    // AWS instance type
-    std::string instance_type;
-
     // For NEURON, there can be multiple accelerators behind a single PCI device.
     // Right shift the gpu_id by this amount to get to the physical GPU id.
     int gpu_id_shift;
@@ -62,7 +59,6 @@ private:
 
     // PCIe to Libfabric device mapping
     std::map<std::string, std::string> pcie_to_libfabric_map;
-    std::map<std::string, std::string> libfabric_to_pcie_map;
 
     // Helper methods
     nixl_status_t
