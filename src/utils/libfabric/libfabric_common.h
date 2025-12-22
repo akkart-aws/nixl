@@ -168,6 +168,9 @@ getAvailableNetworkDevices();
 // String utilities
 std::string
 hexdump(const void *data);
+// AWS instance type detection
+std::string
+getAwsInstanceType();
 } // namespace LibfabricUtils
 
 #endif // NIXL_SRC_UTILS_LIBFABRIC_LIBFABRIC_COMMON_H

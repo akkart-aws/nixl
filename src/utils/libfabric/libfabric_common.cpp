@@ -23,6 +23,7 @@
 #include <sstream>
 #include <atomic>
 #include <cstring>
+#include <fstream>
 
 #include <rdma/fabric.h>
 #include <rdma/fi_domain.h>
@@ -159,6 +160,17 @@ void
 resetSeqId() {
     // Reset SEQ_ID counter for new postXfer
     g_seq_id_counter.store(0);
+}
+
+std::string
+getAwsInstanceType() {
+    std::ifstream instance_type_file("/sys/devices/virtual/dmi/id/product_name");
+    if (instance_type_file) {
+        std::string instance_type;
+        std::getline(instance_type_file, instance_type);
+        return instance_type;
+    }
+    return ""; // Return empty string if not available
 }
 
 } // namespace LibfabricUtils

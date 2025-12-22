@@ -43,12 +43,6 @@ nixlLibfabricTopology::nixlLibfabricTopology()
 
     NIXL_TRACE << "Starting automatic topology discovery";
 
-    // Discover AWS instance type, if available.
-    std::ifstream instance_type_file("/sys/devices/virtual/dmi/id/product_name");
-    if (instance_type_file) {
-        std::getline(instance_type_file, instance_type);
-    }
-
     // Discover topology immediately - hard error if it fails
     nixl_status_t status = discoverTopology();
     if (status != NIXL_SUCCESS) {
@@ -380,7 +374,6 @@ nixlLibfabricTopology::discoverEfaDevicesWithHwloc() {
 nixl_status_t
 nixlLibfabricTopology::buildPcieToLibfabricMapping() {
     pcie_to_libfabric_map.clear();
-    libfabric_to_pcie_map.clear();
 
     // Get EFA device info with PCIe addresses from libfabric
     struct fi_info *hints, *info;
@@ -420,7 +413,6 @@ nixlLibfabricTopology::buildPcieToLibfabricMapping() {
 
                 std::string pcie_address = pcie_addr;
                 pcie_to_libfabric_map[pcie_address] = libfabric_name;
-                libfabric_to_pcie_map[libfabric_name] = pcie_address;
 
                 NIXL_TRACE << "Mapped PCIe " << pcie_address << " → Libfabric " << libfabric_name
                            << " (provider=" << provider_name << ")";
@@ -438,6 +430,9 @@ nixlLibfabricTopology::buildPcieToLibfabricMapping() {
 nixl_status_t
 nixlLibfabricTopology::buildGpuToEfaMapping() {
     gpu_to_efa_devices.clear();
+
+    // Get AWS instance type
+    std::string instance_type = LibfabricUtils::getAwsInstanceType();
 
     nixl_status_t status;
     if (instance_type.compare(0, 3, "trn", 3) == 0 ||
@@ -461,6 +456,9 @@ nixlLibfabricTopology::buildGpuToEfaMapping() {
 
 nixl_status_t
 nixlLibfabricTopology::buildStaticNeuronGrouping() {
+    // Get AWS instance type
+    std::string instance_type = LibfabricUtils::getAwsInstanceType();
+
     static const char *const trn2_seng_nic_mapping[16] = {
         "0:c9:00.0", // RID  0
         "0:ca:00.0", // RID  1
@@ -525,7 +523,7 @@ nixlLibfabricTopology::buildStaticNeuronGrouping() {
     const int *rid_mapping = nullptr;
     const char *const *nic_mapping = nullptr;
 
-    auto instance_type_startswith = [this](const std::string& prefix) {
+    auto instance_type_startswith = [&instance_type](const std::string &prefix) {
         return instance_type.compare(0, prefix.size(), prefix) == 0;
     };
     if (instance_type_startswith("trn2")) {
