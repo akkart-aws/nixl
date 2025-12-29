@@ -107,10 +107,10 @@
  * fields needed for fragment identification and reassembly.
  */
 struct BinaryNotificationHeader {
-    uint16_t notif_xfer_id;   // Transfer ID for matching notifications
-    uint16_t notif_seq_id;    // Fragment index (0, 1, 2...)
-    uint16_t notif_seq_len;   // Total number of fragments
-    uint32_t payload_length;  // Message bytes of this fragment
+    uint16_t notif_xfer_id; // Transfer ID for matching notifications
+    uint16_t notif_seq_id; // Fragment index (0, 1, 2...)
+    uint16_t notif_seq_len; // Total number of fragments
+    uint32_t payload_length; // Message bytes of this fragment
 } __attribute__((packed));
 
 /**
@@ -120,9 +120,9 @@ struct BinaryNotificationHeader {
  * so we only send it once in the first fragment.
  */
 struct BinaryNotificationMetadata {
-    uint32_t total_payload_length;  // Total message bytes across all fragments
-    uint32_t expected_completions;  // Expected RDMA write completions
-    uint16_t agent_name_length;     // Actual length of agent_name
+    uint32_t total_payload_length; // Total message bytes across all fragments
+    uint32_t expected_completions; // Expected RDMA write completions
+    uint16_t agent_name_length; // Actual length of agent_name
 } __attribute__((packed));
 
 /**
@@ -143,8 +143,8 @@ struct BinaryNotificationMetadata {
  */
 struct BinaryNotification {
     BinaryNotificationHeader header_;
-    BinaryNotificationMetadata metadata_;  // Only valid for seq_id=0
-    std::vector<char> buffer_;  // Chunk of (agent_name + message) combined payload
+    BinaryNotificationMetadata metadata_; // Only valid for seq_id=0
+    std::vector<char> buffer_; // Chunk of (agent_name + message) combined payload
 
     /** @brief Constructor */
     BinaryNotification() {
@@ -173,8 +173,8 @@ struct BinaryNotification {
      */
     void
     setMetadata(uint32_t total_payload_length,
-                          uint32_t expected_completions,
-                          uint16_t agent_name_length) {
+                uint32_t expected_completions,
+                uint16_t agent_name_length) {
         assert(header_.notif_seq_id == 0 && "setMetadata() can only be called for fragment 0");
         metadata_.total_payload_length = total_payload_length;
         metadata_.expected_completions = expected_completions;
@@ -194,7 +194,7 @@ struct BinaryNotification {
     }
 
     /** @brief Get header (valid for all fragments) */
-    const BinaryNotificationHeader&
+    const BinaryNotificationHeader &
     getHeader() const {
         return header_;
     }
@@ -204,7 +204,7 @@ struct BinaryNotification {
      * @return Reference to metadata
      * @pre header_.notif_seq_id must be 0
      */
-    const BinaryNotificationMetadata&
+    const BinaryNotificationMetadata &
     getMetadata() const {
         assert(header_.notif_seq_id == 0 && "getMetadata() can only be called for fragment 0");
         return metadata_;
@@ -235,7 +235,7 @@ struct BinaryNotification {
 
     /** @brief Deserialize from buffer */
     static void
-    deserialize(const void *buffer, size_t size, BinaryNotification& notif_out) {
+    deserialize(const void *buffer, size_t size, BinaryNotification &notif_out) {
         const char *ptr = static_cast<const char *>(buffer);
         size_t offset = 0;
 
@@ -248,7 +248,7 @@ struct BinaryNotification {
             memcpy(&notif_out.metadata_, ptr + offset, sizeof(notif_out.metadata_));
             offset += sizeof(notif_out.metadata_);
         }
-        
+
         // Read combined_payload_chunk
         size_t remaining = size - offset;
         notif_out.buffer_.resize(remaining);

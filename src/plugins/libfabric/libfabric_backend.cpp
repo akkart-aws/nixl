@@ -193,15 +193,9 @@ nixlLibfabricBackendH::init_request_tracking(size_t num_requests) {
 
 void
 nixlLibfabricBackendH::increment_completed_requests() {
-    size_t completed = completed_requests_.fetch_add(1);
-    NIXL_DEBUG << "Request completed, total completed: " << completed << "/"
+    completed_requests_.fetch_add(1);
+    NIXL_DEBUG << "Request completed, total completed: " << completed_requests_.load() << "/"
                << submitted_requests_.load();
-}
-
-void
-nixlLibfabricBackendH::increment_submitted_requests() {
-    size_t submitted = submitted_requests_.fetch_add(1);
-    NIXL_DEBUG << "Request submitted, total submitted: " << submitted;
 }
 
 size_t
@@ -215,7 +209,7 @@ nixlLibfabricBackendH::get_submitted_requests_count() const {
 }
 
 void
-nixlLibfabricBackendH::adjust_total_requests(size_t actual_count) {
+nixlLibfabricBackendH::adjust_total_submitted_requests(size_t actual_count) {
     submitted_requests_.store(actual_count);
     NIXL_DEBUG << "Adjusted total requests to actual count: " << actual_count;
 }
@@ -845,9 +839,8 @@ nixlLibfabricEngine::loadMetadataHelper(const std::vector<uint64_t> &rail_keys,
     pub_md->remote_buf_addr_ = reinterpret_cast<uint64_t>(buffer);
     pub_md->conn_ = conn;
 
-    NIXL_DEBUG << "Metadata loaded with"
-               << " Remote addr: " << (void *)pub_md->remote_buf_addr_ << " Remote keys for "
-               << pub_md->rail_remote_key_list_.size() << " rails"
+    NIXL_DEBUG << "Metadata loaded with" << " Remote addr: " << (void *)pub_md->remote_buf_addr_
+               << " Remote keys for " << pub_md->rail_remote_key_list_.size() << " rails"
                << " Remote fi_addr: " << pub_md->conn_->rail_remote_addr_list_[0][0];
     output = pub_md.release();
     return NIXL_SUCCESS;
@@ -943,9 +936,10 @@ nixlLibfabricEngine::prepXfer(const nixl_xfer_op_t &operation,
         backend_handle->has_notif = true;
 
         // Use common fragmentation helper function
-        fragmentNotificationMessage(
-            opt_args->notifMsg, localAgent, backend_handle->total_notif_msg_len,
-            backend_handle->binary_notifs);
+        fragmentNotificationMessage(opt_args->notifMsg,
+                                    localAgent,
+                                    backend_handle->total_notif_msg_len,
+                                    backend_handle->binary_notifs);
 
         NIXL_DEBUG << "prepXfer: Fragmented notification into "
                    << backend_handle->binary_notifs.size()
@@ -1017,8 +1011,11 @@ nixlLibfabricEngine::postXfer(const nixl_xfer_op_t &operation,
 
     op_type = (operation == NIXL_WRITE) ? nixlLibfabricReq::WRITE : nixlLibfabricReq::READ;
 
-    // Initialize submittted and completed request count to 0 for each postXfer.
-    backend_handle->init_request_tracking(0);
+    // Set initial submit request count to maximum possible requests for this xfer.
+    size_t max_possible_requests = desc_count * rail_manager.getNumDataRails();
+    backend_handle->init_request_tracking(max_possible_requests);
+
+    size_t total_submitted = 0;
 
     // Core transfer submission to process each descriptor with direct submission
     for (int desc_idx = 0; desc_idx < desc_count; ++desc_idx) {
@@ -1050,6 +1047,7 @@ nixlLibfabricEngine::postXfer(const nixl_xfer_op_t &operation,
         // Use descriptor's specific target address
         uint64_t remote_target_addr = remote[desc_idx].addr;
 
+        size_t submitted_count = 0;
         nixl_status_t status = rail_manager.prepareAndSubmitTransfer(
             op_type,
             transfer_addr,
@@ -1065,10 +1063,7 @@ nixlLibfabricEngine::postXfer(const nixl_xfer_op_t &operation,
             [backend_handle]() {
                 backend_handle->increment_completed_requests();
             }, // Completion callback
-            [backend_handle]() {
-                backend_handle->increment_submitted_requests();
-            } // Submission callback
-        );
+            submitted_count);
 
         if (status != NIXL_SUCCESS) {
             NIXL_ERROR << "prepareAndSubmitTransfer failed for descriptor " << desc_idx << " GPU "
@@ -1076,19 +1071,24 @@ nixlLibfabricEngine::postXfer(const nixl_xfer_op_t &operation,
             return status;
         }
 
+        // Add submitted requests to the total count
+        total_submitted += submitted_count;
+
         NIXL_DEBUG << "Successfully processed descriptor " << desc_idx << " with "
-                   << backend_handle->get_submitted_requests_count()
-                   << " requests submitted so far";
+                   << submitted_count << " requests submitted (accumulated: " << total_submitted
+                   << ")";
     }
 
-    NIXL_DEBUG << "Processing complete: submitted "
-               << backend_handle->get_submitted_requests_count() << " requests from " << desc_count
-               << " descriptors";
+    NIXL_DEBUG << "Processing complete: submitted " << total_submitted << " requests from "
+               << desc_count << " descriptors" << " for xfer_id" << backend_handle->post_xfer_id;
 
-    // For same-agent transfers, we need to set the total to 0 since we bypassed all rail operations
+    // For same-agent transfers, override to 0 since we bypassed all rail operations
     if (remote_agent == localAgent) {
-        backend_handle->adjust_total_requests(0);
+        backend_handle->adjust_total_submitted_requests(0);
         NIXL_DEBUG << "Same-agent transfer: adjusted total requests to 0 (all handled via memcpy)";
+    } else {
+        // Adjust to actual request count after all submissions complete
+        backend_handle->adjust_total_submitted_requests(total_submitted);
     }
 
     // Send notification immediately after successful request submission
@@ -1185,82 +1185,86 @@ nixlLibfabricEngine::releaseReqH(nixlBackendReqH *handle) const {
  *****************************************/
 
 void
-nixlLibfabricEngine::fragmentNotificationMessage(const std::string &message,
-                                                 const std::string &agent_name,
-                                                 uint32_t &total_message_length,
-                                                 std::vector<BinaryNotification> &fragments_out) const {
+nixlLibfabricEngine::fragmentNotificationMessage(
+    const std::string &message,
+    const std::string &agent_name,
+    uint32_t &total_message_length,
+    std::vector<BinaryNotification> &fragments_out) const {
     // agent_name + message forms a single combined payload
     std::string combined_payload = agent_name + message;
     total_message_length = static_cast<uint32_t>(combined_payload.length());
-    
+
     const size_t max_control_msg_size = BinaryNotification::getFragmentSize();
-    
+
     // Calculate fragment 0 capacity (has extra headers)
     size_t frag0_overhead = sizeof(BinaryNotificationHeader) + sizeof(BinaryNotificationMetadata);
     size_t frag0_capacity = max_control_msg_size - frag0_overhead;
-    
+
     // Calculate fragment 1+ capacity (only has minimal header)
     size_t frag_overhead = sizeof(BinaryNotificationHeader);
     size_t frag_capacity = max_control_msg_size - frag_overhead;
-    
+
     // Calculate number of fragments needed
-    size_t num_fragments = 1;  // At least fragment 0
+    size_t num_fragments = 1; // At least fragment 0
     size_t remaining = 0;
     if (total_message_length > frag0_capacity) {
         remaining = total_message_length - frag0_capacity;
         num_fragments += (remaining + frag_capacity - 1) / frag_capacity;
     }
-    
+
     fragments_out.clear();
     fragments_out.resize(num_fragments);
-    
+
     NIXL_DEBUG << "Fragmenting: agent_name=" << agent_name.length()
                << "B, message=" << message.length()
-               << "B, combined_payload=" << total_message_length
-               << "B, fragments=" << num_fragments
-               << ", frag0_capacity=" << frag0_capacity
-               << ", frag_capacity=" << frag_capacity;
-    
+               << "B, combined_payload=" << total_message_length << "B, fragments=" << num_fragments
+               << ", frag0_capacity=" << frag0_capacity << ", frag_capacity=" << frag_capacity;
+
     size_t offset = 0;
-    
+
     for (size_t frag_idx = 0; frag_idx < num_fragments; ++frag_idx) {
         // Set header fields
         BinaryNotificationHeader header;
-        header.notif_xfer_id = 0;  // Will be set later in notifSendPriv
+        header.notif_xfer_id = 0; // Will be set later in notifSendPriv
         header.notif_seq_id = static_cast<uint16_t>(frag_idx);
         header.notif_seq_len = static_cast<uint16_t>(num_fragments);
-        
+
         if (frag_idx == 0) {
             // Fragment 0: Pack metadata + combined_payload_chunk
-            size_t payload_chunk_len = std::min(frag0_capacity, static_cast<size_t>(total_message_length));
+            size_t payload_chunk_len =
+                std::min(frag0_capacity, static_cast<size_t>(total_message_length));
             header.payload_length = static_cast<uint32_t>(payload_chunk_len);
-            
+
             fragments_out[0].setHeader(header);
             fragments_out[0].setMetadata(total_message_length,
-                                        0,  // expected_completions set later
-                                        static_cast<uint16_t>(agent_name.length()));
+                                         0, // expected_completions set later
+                                         static_cast<uint16_t>(agent_name.length()));
             // Set the combined payload chunk directly
             fragments_out[0].setCombinedPayload(combined_payload.substr(0, payload_chunk_len));
-            
+
             offset = payload_chunk_len;
-            
+
             NIXL_DEBUG << "Fragment 0: combined_payload_chunk=" << payload_chunk_len << "B";
         } else {
             // Fragment 1+: Pack only combined_payload continuation
-            size_t payload_chunk_len = std::min(frag_capacity, static_cast<size_t>(total_message_length) - offset);
+            size_t payload_chunk_len =
+                std::min(frag_capacity, static_cast<size_t>(total_message_length) - offset);
             header.payload_length = static_cast<uint32_t>(payload_chunk_len);
-            
+
             fragments_out[frag_idx].setHeader(header);
             // Set the combined payload chunk directly
-            fragments_out[frag_idx].setCombinedPayload(combined_payload.substr(offset, payload_chunk_len));
-            
+            fragments_out[frag_idx].setCombinedPayload(
+                combined_payload.substr(offset, payload_chunk_len));
+
             offset += payload_chunk_len;
-            
-            NIXL_DEBUG << "Fragment " << frag_idx << ": combined_payload_chunk=" << payload_chunk_len << "B";
+
+            NIXL_DEBUG << "Fragment " << frag_idx
+                       << ": combined_payload_chunk=" << payload_chunk_len << "B";
         }
     }
-    
-    NIXL_DEBUG << "Fragmentation complete: " << num_fragments << " fragments, total_payload=" << total_message_length << "B";
+
+    NIXL_DEBUG << "Fragmentation complete: " << num_fragments
+               << " fragments, total_payload=" << total_message_length << "B";
 }
 
 // notifSendPriv that accepts vector of BinaryNotifications for fragmentation support
@@ -1290,21 +1294,19 @@ nixlLibfabricEngine::notifSendPriv(const std::string &remote_agent,
         BinaryNotificationHeader header = binary_notification.getHeader();
         header.notif_xfer_id = notif_xfer_id;
         binary_notification.setHeader(header);
-        
+
         // Update first fragment header with expected_completions (only for fragment 0)
         // Note: agent_name_length was already set during fragmentation
         if (seq_id == 0) {
             const BinaryNotificationMetadata &metadata = binary_notification.getMetadata();
-            binary_notification.setMetadata(total_message_length,
-                                           expected_completions,
-                                           metadata.agent_name_length);
+            binary_notification.setMetadata(
+                total_message_length, expected_completions, metadata.agent_name_length);
         }
 
         // Allocate control request for this notification fragment
         size_t max_size = BinaryNotification::getFragmentSize();
-        nixlLibfabricReq *control_request =
-            rail_manager.getControlRail(control_rail_id)
-                .allocateControlRequest(max_size, notif_xfer_id);
+        nixlLibfabricReq *control_request = rail_manager.getControlRail(control_rail_id)
+                                                .allocateControlRequest(max_size, notif_xfer_id);
 
         if (!control_request) {
             NIXL_ERROR << "Failed to allocate control request for notification fragment " << seq_id;
@@ -1316,8 +1318,7 @@ nixlLibfabricEngine::notifSendPriv(const std::string &remote_agent,
         control_request->buffer_size = serialized_size;
 
         NIXL_DEBUG << "Sending binary notification fragment " << seq_id << "/"
-                   << binary_notifications.size()
-                   << " size=" << serialized_size << "B"
+                   << binary_notifications.size() << " size=" << serialized_size << "B"
                    << " payload_chunk_size=" << header.payload_length << "B"
                    << " notif_xfer_id=" << header.notif_xfer_id;
 
@@ -1497,10 +1498,10 @@ nixlLibfabricEngine::processNotification(const std::string &serialized_notif) {
     uint16_t notif_xfer_id = header.notif_xfer_id;
     uint16_t notif_seq_id = header.notif_seq_id;
     uint16_t notif_seq_len = header.notif_seq_len;
-    
+
     // Get payload chunk (combined agent_name + message chunk for all fragments)
     std::string payload_chunk(binary_notif.buffer_.data(), binary_notif.buffer_.size());
-    
+
     // Get metadata from first fragment (only valid for fragment 0)
     uint32_t expected_completions = 0;
     uint32_t total_payload_length = 0;
@@ -1512,9 +1513,9 @@ nixlLibfabricEngine::processNotification(const std::string &serialized_notif) {
         agent_name_length = metadata.agent_name_length;
     }
 
-    NIXL_TRACE << "Received notification fragment"
-               << " notif_xfer_id=" << notif_xfer_id << " notif_seq_id=" << notif_seq_id << "/"
-               << notif_seq_len << " payload_chunk_size=" << payload_chunk.size()
+    NIXL_TRACE << "Received notification fragment" << " notif_xfer_id=" << notif_xfer_id
+               << " notif_seq_id=" << notif_seq_id << "/" << notif_seq_len
+               << " payload_chunk_size=" << payload_chunk.size()
                << " expected_completions=" << expected_completions;
 
     {
@@ -1522,10 +1523,9 @@ nixlLibfabricEngine::processNotification(const std::string &serialized_notif) {
 
         // Use try_emplace to construct in-place - eliminates extra copy
         auto [it, inserted] = pending_notifications_.try_emplace(notif_xfer_id, notif_xfer_id);
-        
+
         if (inserted) {
-            NIXL_DEBUG << "Created pending notification"
-                       << " notif_xfer_id=" << notif_xfer_id
+            NIXL_DEBUG << "Created pending notification" << " notif_xfer_id=" << notif_xfer_id
                        << " expected_completions=" << expected_completions
                        << " expected_msg_fragments=" << notif_seq_len;
         }
@@ -1552,7 +1552,7 @@ nixlLibfabricEngine::processNotification(const std::string &serialized_notif) {
         // Store payload chunk (combined agent_name + message chunk)
         it->second.message_fragments[notif_seq_id] = payload_chunk;
         it->second.received_msg_fragments++;
-        
+
         // Update metadata from fragment 0 (agent_name will be extracted after reassembly)
         if (notif_seq_id == 0) {
             it->second.expected_completions = expected_completions;
@@ -1560,10 +1560,9 @@ nixlLibfabricEngine::processNotification(const std::string &serialized_notif) {
             it->second.agent_name_length = agent_name_length;
         }
 
-        NIXL_DEBUG << "Stored fragment"
-                   << " notif_xfer_id=" << notif_xfer_id << " fragment " << notif_seq_id << "/"
-                   << notif_seq_len << " received_msg_fragments="
-                   << it->second.received_msg_fragments
+        NIXL_DEBUG << "Stored fragment" << " notif_xfer_id=" << notif_xfer_id << " fragment "
+                   << notif_seq_id << "/" << notif_seq_len
+                   << " received_msg_fragments=" << it->second.received_msg_fragments
                    << " expected_completions=" << it->second.expected_completions
                    << " received_completions=" << it->second.received_completions;
     }
@@ -1676,7 +1675,7 @@ nixlLibfabricEngine::addReceivedXferId(uint16_t xfer_id) {
         // First parameter: map key for lookup
         // Second parameter: constructor argument for PendingNotification
         auto [it, inserted] = pending_notifications_.try_emplace(xfer_id, xfer_id);
-        
+
         if (inserted) {
             // Set placeholder values for write-arrived-first case
             it->second.remote_agent = "";
@@ -1690,8 +1689,7 @@ nixlLibfabricEngine::addReceivedXferId(uint16_t xfer_id) {
 
         it->second.received_completions++;
         NIXL_DEBUG << "Incremented received count for notif_xfer_id " << xfer_id << ": "
-                   << it->second.received_completions << "/"
-                   << it->second.expected_completions;
+                   << it->second.received_completions << "/" << it->second.expected_completions;
     }
 
     // Check if any notifications can now be completed (after releasing the lock)
@@ -1729,7 +1727,7 @@ nixlLibfabricEngine::checkPendingNotifications() {
             uint16_t agent_name_len = it->second.agent_name_length;
             std::string remote_agent;
             std::string message;
-            
+
             if (agent_name_len > 0 && combined_payload.size() >= agent_name_len) {
                 remote_agent = combined_payload.substr(0, agent_name_len);
                 if (combined_payload.size() > agent_name_len) {
