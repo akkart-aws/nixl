@@ -178,43 +178,72 @@ nixlLibfabricRailManager::prepareAndSubmitTransfer(
 
     // Determine striping strategy
     bool use_striping = shouldUseStriping(transfer_size) && selected_rails.size() > 1;
-    NIXL_DEBUG << "use_striping=" << use_striping;
+
+    // Setup iteration parameters based on strategy
+    size_t num_rails;
+    size_t chunk_size;
+    size_t remainder = 0;
+    size_t start_rail_idx = 0;
+
     if (!use_striping) {
-        // Round-robin: use one rail for entire transfer
+        // Round-robin: process once with selected rail
+        num_rails = 1;
+        chunk_size = transfer_size;
         const auto counter_value = round_robin_counter.fetch_add(1);
-        const size_t rail_id = selected_rails[counter_value % selected_rails.size()];
+        start_rail_idx = counter_value % selected_rails.size();
+        NIXL_DEBUG << "Round-robin mode: using rail " << selected_rails[start_rail_idx];
+    } else {
+        // Striping: process all rails
+        num_rails = selected_rails.size();
+        chunk_size = transfer_size / num_rails;
+        remainder = transfer_size % num_rails;
+        NIXL_DEBUG << "Striping mode: using " << num_rails << " rails";
+    }
+
+    // Unified loop for both strategies
+    for (size_t i = 0; i < num_rails; ++i) {
+        // Select rail and endpoint
+        const size_t rail_idx = use_striping ? i : start_rail_idx;
+        const size_t rail_id = selected_rails[rail_idx];
         const size_t remote_ep_id =
-            remote_selected_endpoints[counter_value % remote_selected_endpoints.size()];
-        NIXL_DEBUG << "rail " << rail_id << ", remote_ep_id " << remote_ep_id;
+            remote_selected_endpoints[rail_idx % remote_selected_endpoints.size()];
+
+        // Calculate chunk parameters
+        size_t chunk_offset = use_striping ? (i * chunk_size) : 0;
+        size_t current_chunk_size =
+            chunk_size + (use_striping && i == num_rails - 1 ? remainder : 0);
+
+        if (current_chunk_size == 0) break;
         // Allocate request
         nixlLibfabricReq *req = data_rails_[rail_id]->allocateDataRequest(op_type, xfer_id);
         if (!req) {
             NIXL_ERROR << "Failed to allocate request for rail " << rail_id;
             return NIXL_ERR_BACKEND;
         }
-        // Set completion callback and populate request
-        req->completion_callback = completion_callback;
-        req->chunk_offset = 0;
-        req->chunk_size = transfer_size;
-        req->local_addr = local_addr;
 
-        // For TCP providers, use offset 0 instead of virtual address
+        // Populate request
+        req->completion_callback = completion_callback;
+        req->chunk_offset = chunk_offset;
+        req->chunk_size = current_chunk_size;
+        req->local_addr = static_cast<char *>(local_addr) + chunk_offset;
+
+        // For TCP providers, use offset instead of virtual address
         // TCP providers don't support FI_MR_VIRT_ADDR and expect offset-based addressing
         if (data_rails_[rail_id]->getRailInfo()->domain_attr->mr_mode & FI_MR_VIRT_ADDR) {
-            req->remote_addr = remote_base_addr; // Use virtual address for EFA and other providers
+            req->remote_addr =
+                remote_base_addr + chunk_offset; // Use virtual address for EFA and other providers
         } else {
-            req->remote_addr = 0; // Use offset 0 for TCP providers
-            NIXL_DEBUG << "TCP provider detected: using offset 0 instead of virtual address "
-                       << (void *)remote_base_addr << " for rail " << rail_id;
+            req->remote_addr = chunk_offset; // Use chunk offset for TCP providers
+            NIXL_DEBUG << "TCP provider: using offset " << chunk_offset;
         }
 
         req->local_mr = local_mrs[rail_id];
         req->remote_key = remote_keys[remote_ep_id];
         req->rail_id = rail_id;
-        // Submit immediately
+
+        // Submit operation
         nixl_status_t status;
         if (op_type == nixlLibfabricReq::WRITE) {
-            // Generate next SEQ_ID for this specific write operation
             uint8_t seq_id = LibfabricUtils::getNextSeqId();
             uint64_t imm_data =
                 NIXL_MAKE_IMM_DATA(NIXL_LIBFABRIC_MSG_TRANSFER, agent_idx, xfer_id, seq_id);
@@ -235,103 +264,22 @@ nixlLibfabricRailManager::prepareAndSubmitTransfer(
                                                     req->remote_key,
                                                     req);
         }
+
         if (status != NIXL_SUCCESS) {
-            // Release the allocated request back to pool on failure
+            // This request failed to submit - release it immediately
             data_rails_[rail_id]->releaseRequest(req);
             NIXL_ERROR << "Failed to submit "
                        << (op_type == nixlLibfabricReq::WRITE ? "write" : "read") << " on rail "
-                       << rail_id << ", request released";
+                       << rail_id;
             return status;
         }
 
         // Track submitted request
-        submitted_count_out = 1;
-
-        NIXL_DEBUG << "Round-robin: submitted single request on rail " << rail_id << " for "
-                   << transfer_size << " bytes, XFER_ID=" << req->xfer_id;
-
-    } else {
-        // Striping: distribute across multiple rails
-        size_t num_rails = selected_rails.size();
-        size_t chunk_size = transfer_size / num_rails;
-        size_t remainder = transfer_size % num_rails;
-        for (size_t i = 0; i < num_rails; ++i) {
-            const size_t rail_id = selected_rails[i];
-            const size_t remote_ep_id =
-                remote_selected_endpoints[i % remote_selected_endpoints.size()];
-            NIXL_DEBUG << "rail " << rail_id << ", remote_ep_id=" << remote_ep_id;
-            size_t current_chunk_size = chunk_size + (i == num_rails - 1 ? remainder : 0);
-            if (current_chunk_size == 0) break;
-            // Allocate request
-            nixlLibfabricReq *req = data_rails_[rail_id]->allocateDataRequest(op_type, xfer_id);
-            if (!req) {
-                NIXL_ERROR << "Failed to allocate request for rail " << rail_id;
-                return NIXL_ERR_BACKEND;
-            }
-
-            req->completion_callback = completion_callback;
-
-            // Calculate and populate chunk info
-            size_t chunk_offset = i * chunk_size;
-            req->chunk_offset = chunk_offset;
-            req->chunk_size = current_chunk_size;
-            req->local_addr = static_cast<char *>(local_addr) + chunk_offset;
-
-            // For TCP providers, use offset instead of virtual address
-            // TCP providers don't support FI_MR_VIRT_ADDR and expect offset-based addressing
-            if (data_rails_[rail_id]->getRailInfo()->domain_attr->mr_mode & FI_MR_VIRT_ADDR) {
-                req->remote_addr = remote_base_addr +
-                    chunk_offset; // Use virtual address for EFA and other providers
-            } else {
-                req->remote_addr = chunk_offset; // Use chunk offset for TCP providers
-                NIXL_DEBUG << "TCP provider detected: using chunk offset " << chunk_offset
-                           << " instead of virtual address "
-                           << (void *)(remote_base_addr + chunk_offset) << " for rail " << rail_id;
-            }
-
-            req->local_mr = local_mrs[rail_id];
-            req->remote_key = remote_keys[remote_ep_id];
-            req->rail_id = rail_id;
-            nixl_status_t status;
-            if (op_type == nixlLibfabricReq::WRITE) {
-                // Generate next SEQ_ID for this specific transfer operation
-                uint8_t seq_id = LibfabricUtils::getNextSeqId();
-                uint64_t imm_data =
-                    NIXL_MAKE_IMM_DATA(NIXL_LIBFABRIC_MSG_TRANSFER, agent_idx, xfer_id, seq_id);
-                status = data_rails_[rail_id]->postWrite(req->local_addr,
-                                                         req->chunk_size,
-                                                         fi_mr_desc(req->local_mr),
-                                                         imm_data,
-                                                         dest_addrs.at(rail_id)[remote_ep_id],
-                                                         req->remote_addr,
-                                                         req->remote_key,
-                                                         req);
-            } else {
-                status = data_rails_[rail_id]->postRead(req->local_addr,
-                                                        req->chunk_size,
-                                                        fi_mr_desc(req->local_mr),
-                                                        dest_addrs.at(rail_id)[remote_ep_id],
-                                                        req->remote_addr,
-                                                        req->remote_key,
-                                                        req);
-            }
-            if (status != NIXL_SUCCESS) {
-                // This request failed to submit - release it immediately
-                data_rails_[rail_id]->releaseRequest(req);
-                NIXL_ERROR << "Failed to submit "
-                           << (op_type == nixlLibfabricReq::WRITE ? "write" : "read") << " on rail "
-                           << rail_id << ", request released";
-                return status;
-            }
-
-            // Track submitted request
-            submitted_count_out++;
-        }
-        NIXL_DEBUG << "Striping: submitted " << submitted_count_out << " requests for "
-                   << transfer_size << " bytes";
+        submitted_count_out++;
     }
 
-    NIXL_DEBUG << "Successfully submitted requests for " << transfer_size << " bytes";
+    NIXL_DEBUG << "Successfully submitted " << submitted_count_out << " requests for "
+               << transfer_size << " bytes";
 
     return NIXL_SUCCESS;
 }
