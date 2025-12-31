@@ -200,7 +200,6 @@ private:
 
     // Threading infrastructure - remaining members
     // Connection Management (CM) thread
-    std::mutex cm_mutex_;
     std::thread cm_thread_;
     std::condition_variable cm_cv_;
 
