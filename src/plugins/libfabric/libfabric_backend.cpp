@@ -1078,7 +1078,7 @@ nixlLibfabricEngine::postXfer(const nixl_xfer_op_t &operation,
         uint64_t remote_target_addr = remote[desc_idx].addr;
 
         size_t submitted_count = 0;
-        nixl_status_t status = rail_manager.prepareAndSubmitTransfer(
+        nixl_status_t status = rail_manager.postTransfer(
             op_type,
             transfer_addr,
             transfer_size,
