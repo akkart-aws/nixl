@@ -1075,9 +1075,7 @@ nixlLibfabricRail::postRecv(nixlLibfabricReq *req) const {
 }
 
 nixl_status_t
-nixlLibfabricRail::postSend(uint64_t immediate_data,
-                            fi_addr_t dest_addr,
-                            nixlLibfabricReq *req) const {
+nixlLibfabricRail::postSend(nixlLibfabricReq *req) const {
     if (req->buffer_size == 0 || req->buffer_size > NIXL_LIBFABRIC_SEND_RECV_BUFFER_SIZE) {
         NIXL_ERROR << "Invalid message size=" << req->buffer_size
                    << " (max: " << NIXL_LIBFABRIC_SEND_RECV_BUFFER_SIZE << ")";
@@ -1088,11 +1086,12 @@ nixlLibfabricRail::postSend(uint64_t immediate_data,
     void *desc = fi_mr_desc(req->mr);
 
     NIXL_TRACE << "Sending data on endpoint=" << endpoint << " buffer=" << req->buffer
-               << " size=" << req->buffer_size << " immediate_data=" << std::hex << immediate_data
-               << " msg_type=" << NIXL_GET_MSG_TYPE_FROM_IMM(immediate_data)
-               << " agent_idx=" << NIXL_GET_AGENT_INDEX_FROM_IMM(immediate_data)
-               << " XFER_ID=" << NIXL_GET_XFER_ID_FROM_IMM(immediate_data)
-               << " dest_addr=" << dest_addr << std::dec << " context=" << &req->ctx;
+               << " size=" << req->buffer_size << " immediate_data=" << std::hex
+               << req->immediate_data
+               << " msg_type=" << NIXL_GET_MSG_TYPE_FROM_IMM(req->immediate_data)
+               << " agent_idx=" << NIXL_GET_AGENT_INDEX_FROM_IMM(req->immediate_data)
+               << " XFER_ID=" << NIXL_GET_XFER_ID_FROM_IMM(req->immediate_data)
+               << " dest_addr=" << req->dest_addr << std::dec << " context=" << &req->ctx;
 
     // Retry indefinitely until senddata succeeds or fails for all providers
     int ret = -FI_EAGAIN;
@@ -1100,8 +1099,13 @@ nixlLibfabricRail::postSend(uint64_t immediate_data,
 
     while (true) {
         // Libfabric fi_senddata call
-        ret = fi_senddata(
-            endpoint, req->buffer, req->buffer_size, desc, immediate_data, dest_addr, &req->ctx);
+        ret = fi_senddata(endpoint,
+                          req->buffer,
+                          req->buffer_size,
+                          desc,
+                          req->immediate_data,
+                          req->dest_addr,
+                          &req->ctx);
 
         if (ret == 0) {
             // Success
@@ -1147,24 +1151,21 @@ nixlLibfabricRail::postSend(uint64_t immediate_data,
 }
 
 nixl_status_t
-nixlLibfabricRail::postWrite(const void *local_buffer,
-                             size_t length,
-                             void *local_desc,
-                             uint64_t immediate_data,
-                             fi_addr_t dest_addr,
-                             uint64_t remote_addr,
-                             uint64_t remote_key,
-                             nixlLibfabricReq *req) const {
+nixlLibfabricRail::postWrite(nixlLibfabricReq *req) const {
     // Validation
     if (!req) {
         NIXL_ERROR << "Invalid request for write on rail " << rail_id;
         return NIXL_ERR_INVALID_PARAM;
     }
 
-    NIXL_TRACE << "Posting RDMA write on endpoint=" << endpoint << " local_buffer=" << local_buffer
-               << " length=" << length << " immediate_data=" << immediate_data
-               << " dest_addr=" << dest_addr << " remote_addr=" << (void *)remote_addr
-               << " remote_key=" << remote_key << " context=" << &req->ctx;
+    // Get local descriptor from the request's MR
+    void *local_desc = fi_mr_desc(req->local_mr);
+
+    NIXL_TRACE << "Posting RDMA write on endpoint=" << endpoint
+               << " local_buffer=" << req->local_addr << " length=" << req->chunk_size
+               << " immediate_data=" << req->immediate_data << " dest_addr=" << req->dest_addr
+               << " remote_addr=" << (void *)req->remote_addr << " remote_key=" << req->remote_key
+               << " context=" << &req->ctx;
 
     // Retry indefinitely until writedata succeeds or fails for all providers
     int ret = -FI_EAGAIN;
@@ -1173,13 +1174,13 @@ nixlLibfabricRail::postWrite(const void *local_buffer,
     while (true) {
         // Libfabric fi_writedata call
         ret = fi_writedata(endpoint,
-                           local_buffer,
-                           length,
+                           req->local_addr,
+                           req->chunk_size,
                            local_desc,
-                           immediate_data,
-                           dest_addr,
-                           remote_addr,
-                           remote_key,
+                           req->immediate_data,
+                           req->dest_addr,
+                           req->remote_addr,
+                           req->remote_key,
                            &req->ctx);
 
         if (ret == 0) {
@@ -1226,23 +1227,20 @@ nixlLibfabricRail::postWrite(const void *local_buffer,
 }
 
 nixl_status_t
-nixlLibfabricRail::postRead(void *local_buffer,
-                            size_t length,
-                            void *local_desc,
-                            fi_addr_t dest_addr,
-                            uint64_t remote_addr,
-                            uint64_t remote_key,
-                            nixlLibfabricReq *req) const {
+nixlLibfabricRail::postRead(nixlLibfabricReq *req) const {
     // Validation
     if (!req) {
         NIXL_ERROR << "Invalid request for read on rail " << rail_id;
         return NIXL_ERR_INVALID_PARAM;
     }
 
+    // Get local descriptor from the request's MR
+    void *local_desc = fi_mr_desc(req->local_mr);
+
     NIXL_TRACE << "Posting RDMA read on endpoint=" << std::hex << endpoint
-               << " local_buffer=" << local_buffer << " length=" << length
-               << " dest_addr=" << dest_addr << " remote_addr=" << (void *)remote_addr
-               << " remote_key=" << remote_key << " context=" << &req->ctx;
+               << " local_buffer=" << req->local_addr << " length=" << req->chunk_size
+               << " dest_addr=" << req->dest_addr << " remote_addr=" << (void *)req->remote_addr
+               << " remote_key=" << req->remote_key << " context=" << &req->ctx;
 
     // Retry indefinitely until readdata succeeds or fails for all providers
     int ret = -FI_EAGAIN;
@@ -1251,12 +1249,12 @@ nixlLibfabricRail::postRead(void *local_buffer,
     while (true) {
         // Libfabric fi_read call
         ret = fi_read(endpoint,
-                      local_buffer,
-                      length,
+                      req->local_addr,
+                      req->chunk_size,
                       local_desc,
-                      dest_addr,
-                      remote_addr,
-                      remote_key,
+                      req->dest_addr,
+                      req->remote_addr,
+                      req->remote_key,
                       &req->ctx);
 
         if (ret == 0) {
