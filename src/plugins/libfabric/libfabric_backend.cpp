@@ -422,8 +422,8 @@ nixl_status_t
 nixlLibfabricEngine::getConnInfo(std::string &str) const {
     // Verify all rail endpoints are initialized
     for (size_t rail_id = 0; rail_id < rail_manager.getNumDataRails(); ++rail_id) {
-        if (!rail_manager.getDataRail(rail_id).endpoint) {
-            NIXL_ERROR << "Rail " << rail_id << " endpoint not initialized";
+        if (!rail_manager.getDataRail(rail_id).isProperlyInitialized()) {
+            NIXL_ERROR << "Rail " << rail_id << " not properly initialized";
             return NIXL_ERR_BACKEND;
         }
     }
