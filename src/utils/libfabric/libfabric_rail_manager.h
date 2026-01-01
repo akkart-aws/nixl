@@ -159,7 +159,7 @@ public:
     nixl_status_t
     cleanupConnection(RailType rail_type, const std::vector<fi_addr_t> &fi_addrs_to_remove);
 
-    /** Single-pass transfer preparation and submission with automatic striping/round-robin
+    /** Post data transfer request with automatic striping/round-robin
      * @param op_type Operation type (WRITE or READ)
      * @param local_addr Local memory address
      * @param transfer_size Total transfer size
@@ -176,19 +176,19 @@ public:
      * @return NIXL_SUCCESS on success, error code on failure
      */
     nixl_status_t
-    prepareAndSubmitTransfer(nixlLibfabricReq::OpType op_type,
-                             void *local_addr,
-                             size_t transfer_size,
-                             uint64_t remote_base_addr,
-                             const std::vector<size_t> &selected_rails,
-                             const std::vector<struct fid_mr *> &local_mrs,
-                             const std::vector<uint64_t> &remote_keys,
-                             const std::vector<size_t> &remote_selected_endpoints,
-                             const std::unordered_map<size_t, std::vector<fi_addr_t>> &dest_addrs,
-                             uint16_t agent_idx,
-                             uint16_t xfer_id,
-                             std::function<void()> completion_callback,
-                             size_t &submitted_count_out);
+    postDataRequest(nixlLibfabricReq::OpType op_type,
+                    void *local_addr,
+                    size_t transfer_size,
+                    uint64_t remote_base_addr,
+                    const std::vector<size_t> &selected_rails,
+                    const std::vector<struct fid_mr *> &local_mrs,
+                    const std::vector<uint64_t> &remote_keys,
+                    const std::vector<size_t> &remote_selected_endpoints,
+                    const std::unordered_map<size_t, std::vector<fi_addr_t>> &dest_addrs,
+                    uint16_t agent_idx,
+                    uint16_t xfer_id,
+                    std::function<void()> completion_callback,
+                    size_t &submitted_count_out);
     /** Determine if striping should be used for given transfer size
      * @param transfer_size Size of the transfer in bytes
      * @return true if striping should be used, false for round-robin
@@ -204,7 +204,7 @@ public:
         CONNECTION_ACK, ///< Connection acknowledgment
         DISCONNECT_REQ, ///< Disconnection request
     };
-    /** Send control message via control rail
+    /** Post control request via control rail
      * @param msg_type Type of control message
      * @param req Control request with data buffer
      * @param dest_addr Destination address
@@ -213,7 +213,7 @@ public:
      * @return NIXL_SUCCESS on success, error code on failure
      */
     nixl_status_t
-    postControlMessage(ControlMessageType msg_type,
+    postControlRequest(ControlMessageType msg_type,
                        nixlLibfabricReq *req,
                        fi_addr_t dest_addr,
                        uint16_t agent_idx = 0,
