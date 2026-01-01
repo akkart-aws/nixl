@@ -482,8 +482,8 @@ nixl_status_t
 nixlLibfabricEngine::getConnInfo(std::string &str) const {
     // Verify all rail endpoints are initialized
     for (size_t rail_id = 0; rail_id < rail_manager.getNumDataRails(); ++rail_id) {
-        if (!rail_manager.getDataRail(rail_id).endpoint) {
-            NIXL_ERROR << "Rail " << rail_id << " endpoint not initialized";
+        if (!rail_manager.getDataRail(rail_id).isProperlyInitialized()) {
+            NIXL_ERROR << "Rail " << rail_id << " not properly initialized";
             return NIXL_ERR_BACKEND;
         }
     }
@@ -751,7 +751,7 @@ nixlLibfabricEngine::establishConnection(const std::string &remote_agent) const 
     memcpy(control_request->buffer, serialized_conn_info.data(), serialized_conn_info.length());
     control_request->buffer_size = serialized_conn_info.length();
 
-    nixl_status_t status = rail_manager.postControlMessage(
+    nixl_status_t status = rail_manager.postControlRequest(
         nixlLibfabricRailManager::ControlMessageType::CONNECTION_REQ,
         control_request,
         conn_info->control_rail_remote_addr_list_[0][0], // Always use control rail 0
@@ -1152,7 +1152,7 @@ nixlLibfabricEngine::postXfer(const nixl_xfer_op_t &operation,
         uint64_t remote_target_addr = remote[desc_idx].addr;
 
         size_t submitted_count = 0;
-        nixl_status_t status = rail_manager.prepareAndSubmitTransfer(
+        nixl_status_t status = rail_manager.postDataRequest(
             op_type,
             transfer_addr,
             transfer_size,
@@ -1170,8 +1170,7 @@ nixlLibfabricEngine::postXfer(const nixl_xfer_op_t &operation,
             submitted_count);
 
         if (status != NIXL_SUCCESS) {
-            NIXL_ERROR << "prepareAndSubmitTransfer failed for descriptor " << desc_idx
-                       << " device " << device_id;
+            NIXL_ERROR << "postDataRequest failed for descriptor " << desc_idx << " GPU " << gpu_id;
             return status;
         }
 
@@ -1425,14 +1424,14 @@ nixlLibfabricEngine::notifSendPriv(const std::string &remote_agent,
                    << " payload_chunk_size=" << header.payload_length << "B"
                    << " notif_xfer_id=" << header.notif_xfer_id;
 
-        nixl_status_t status = rail_manager.postControlMessage(
+        nixl_status_t status = rail_manager.postControlRequest(
             nixlLibfabricRailManager::ControlMessageType::NOTIFICATION,
             control_request,
             connection->control_rail_remote_addr_list_[control_rail_id][0],
             connection->agent_index_);
 
         if (status != NIXL_SUCCESS) {
-            NIXL_ERROR << "postControlMessage failed on control rail " << control_rail_id
+            NIXL_ERROR << "postControlRequest failed on control rail " << control_rail_id
                        << " for fragment " << seq_id;
             return NIXL_ERR_BACKEND;
         }
@@ -1568,7 +1567,7 @@ nixlLibfabricEngine::postShutdownCompletion() {
         std::strcpy(static_cast<char *>(control_request->buffer), "SHUTDOWN");
         control_request->buffer_size = shutdown_msg_len;
 
-        nixl_status_t status = rail_manager.postControlMessage(
+        nixl_status_t status = rail_manager.postControlRequest(
             nixlLibfabricRailManager::ControlMessageType::DISCONNECT_REQ,
             control_request,
             self_conn_it->second->rail_remote_addr_list_[rail_id][0],
@@ -1751,7 +1750,7 @@ nixlLibfabricEngine::processConnectionRequest(uint16_t agent_idx,
     std::memcpy(control_request->buffer, rail->ep_name, ep_name_len);
     control_request->buffer_size = ep_name_len;
 
-    nixl_status_t ack_status = rail_manager.postControlMessage(
+    nixl_status_t ack_status = rail_manager.postControlRequest(
         nixlLibfabricRailManager::ControlMessageType::CONNECTION_ACK,
         control_request,
         initiator_control_fi_addr,
