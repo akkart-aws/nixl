@@ -224,28 +224,18 @@ nixlLibfabricRailManager::postTransfer(
         req->remote_key = remote_keys[remote_ep_id];
         req->rail_id = rail_id;
 
+        // Set destination address and immediate data in request
+        req->dest_addr = dest_addrs.at(rail_id)[remote_ep_id];
+
         // Submit operation
         nixl_status_t status;
         if (op_type == nixlLibfabricReq::WRITE) {
             uint8_t seq_id = LibfabricUtils::getNextSeqId();
-            uint64_t imm_data =
+            req->immediate_data =
                 NIXL_MAKE_IMM_DATA(NIXL_LIBFABRIC_MSG_TRANSFER, agent_idx, xfer_id, seq_id);
-            status = data_rails_[rail_id]->postWrite(req->local_addr,
-                                                     req->chunk_size,
-                                                     fi_mr_desc(req->local_mr),
-                                                     imm_data,
-                                                     dest_addrs.at(rail_id)[remote_ep_id],
-                                                     req->remote_addr,
-                                                     req->remote_key,
-                                                     req);
+            status = data_rails_[rail_id]->postWrite(req);
         } else {
-            status = data_rails_[rail_id]->postRead(req->local_addr,
-                                                    req->chunk_size,
-                                                    fi_mr_desc(req->local_mr),
-                                                    dest_addrs.at(rail_id)[remote_ep_id],
-                                                    req->remote_addr,
-                                                    req->remote_key,
-                                                    req);
+            status = data_rails_[rail_id]->postRead(req);
         }
 
         if (status != NIXL_SUCCESS) {
@@ -548,7 +538,8 @@ nixlLibfabricRailManager::postControlMessage(ControlMessageType msg_type,
     uint32_t xfer_id = req->xfer_id;
     // For control messages, use SEQ_ID 0 since they don't need sequence tracking
     // TODO: Add sequencing for connection establishment workflow.
-    uint64_t imm_data = NIXL_MAKE_IMM_DATA(msg_type_value, agent_idx, xfer_id, 0);
+    req->immediate_data = NIXL_MAKE_IMM_DATA(msg_type_value, agent_idx, xfer_id, 0);
+    req->dest_addr = dest_addr;
 
     // Set completion callback if provided
     if (completion_callback) {
@@ -557,10 +548,10 @@ nixlLibfabricRailManager::postControlMessage(ControlMessageType msg_type,
     }
 
     NIXL_DEBUG << "Sending control message type " << msg_type_value << " agent_idx=" << agent_idx
-               << " XFER_ID=" << xfer_id << " imm_data=" << imm_data;
+               << " XFER_ID=" << xfer_id << " imm_data=" << req->immediate_data;
 
     // Rail postSend
-    nixl_status_t status = control_rails_[control_rail_id]->postSend(imm_data, dest_addr, req);
+    nixl_status_t status = control_rails_[control_rail_id]->postSend(req);
 
     if (status != NIXL_SUCCESS) {
         NIXL_ERROR << "Failed to send control message type " << static_cast<int>(msg_type)
