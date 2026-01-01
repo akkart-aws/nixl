@@ -56,6 +56,8 @@ struct nixlLibfabricReq {
     uint64_t remote_addr; ///< Remote memory address for transfers
     struct fid_mr *local_mr; ///< Local memory registration for transfers
     uint64_t remote_key; ///< Remote access key for transfers
+    uint64_t immediate_data; ///< Immediate data for write/send operations
+    fi_addr_t dest_addr; ///< Destination libfabric address
 
     /** Default constructor initializing all fields */
     nixlLibfabricReq()
@@ -72,7 +74,9 @@ struct nixlLibfabricReq {
           local_addr(nullptr),
           remote_addr(0),
           local_mr(nullptr),
-          remote_key(0) {
+          remote_key(0),
+          immediate_data(0),
+          dest_addr(FI_ADDR_UNSPEC) {
         memset(&ctx, 0, sizeof(fi_context));
     }
 };
@@ -249,7 +253,6 @@ public:
     std::string provider_name; ///< Provider name (e.g., "efa", "efa-direct")
     char ep_name[LF_EP_NAME_MAX_LEN]; ///< Endpoint name for connection setup
     mutable bool blocking_cq_sread_supported; ///< Whether blocking CQ reads are supported
-    struct fid_ep *endpoint; ///< Libfabric endpoint handle
 
     /** Initialize libfabric rail with all resources */
     nixlLibfabricRail(const std::string &device, const std::string &provider, uint16_t id);
@@ -310,30 +313,17 @@ public:
     nixl_status_t
     postRecv(nixlLibfabricReq *req) const;
 
-    /** Post send operation with immediate data */
+    /** Post send operation */
     nixl_status_t
-    postSend(uint64_t immediate_data, fi_addr_t dest_addr, nixlLibfabricReq *req) const;
+    postSend(nixlLibfabricReq *req) const;
 
-    /** Post RDMA write operation with immediate data */
+    /** Post RDMA write operation */
     nixl_status_t
-    postWrite(const void *local_buffer,
-              size_t length,
-              void *local_desc,
-              uint64_t immediate_data,
-              fi_addr_t dest_addr,
-              uint64_t remote_addr,
-              uint64_t remote_key,
-              nixlLibfabricReq *req) const;
+    postWrite(nixlLibfabricReq *req) const;
 
     /** Post RDMA read operation */
     nixl_status_t
-    postRead(void *local_buffer,
-             size_t length,
-             void *local_desc,
-             fi_addr_t dest_addr,
-             uint64_t remote_addr,
-             uint64_t remote_key,
-             nixlLibfabricReq *req) const;
+    postRead(nixlLibfabricReq *req) const;
 
     /** Process completion queue with batching support */
     nixl_status_t
@@ -385,6 +375,7 @@ private:
     struct fid_domain *domain; // from rail_domains[rail_id]
     struct fid_cq *cq; // from rail_cqs[rail_id]
     struct fid_av *av; // from rail_avs[rail_id]
+    struct fid_ep *endpoint; ///< Libfabric endpoint handle
 
     // CQ progress mutex to protect completion queue operations
     mutable std::mutex cq_progress_mutex_;
