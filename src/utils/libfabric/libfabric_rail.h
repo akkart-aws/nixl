@@ -378,7 +378,7 @@ private:
     struct fid_ep *endpoint; ///< Libfabric endpoint handle
 
     // CQ progress mutex to protect completion queue operations
-    mutable std::mutex cq_progress_mutex_;
+    mutable std::mutex cq_rail_mutex_;
 
     // Callback functions
     std::function<void(const std::string &)> notificationCallback;

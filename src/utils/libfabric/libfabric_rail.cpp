@@ -428,7 +428,7 @@ nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
         hints->domain_attr->mr_key_size = 2;
     }
     hints->domain_attr->name = strdup(device_name.c_str());
-    hints->domain_attr->threading = FI_THREAD_SAFE;
+    hints->domain_attr->threading = FI_THREAD_COMPLETION;
     try {
         // Get fabric info for this specific device - first try with FI_HMEM
         int ret = fi_getinfo(FI_VERSION(1, 18), NULL, NULL, 0, hints, &info);
@@ -740,7 +740,7 @@ nixlLibfabricRail::progressCompletionQueue(bool use_blocking) const {
 
     // Only protect libfabric CQ hardware operations
     {
-        std::lock_guard<std::mutex> cq_lock(cq_progress_mutex_);
+        std::lock_guard<std::mutex> cq_lock(cq_rail_mutex_);
 
         if (use_blocking && blocking_cq_sread_supported) {
             // Blocking read using fi_cq_sread (used by CM thread)
@@ -1096,14 +1096,17 @@ nixlLibfabricRail::postSend(nixlLibfabricReq *req) const {
     int attempt = 0;
 
     while (true) {
-        // Libfabric fi_senddata call
-        ret = fi_senddata(endpoint,
-                          req->buffer,
-                          req->buffer_size,
-                          desc,
-                          req->immediate_data,
-                          req->dest_addr,
-                          &req->ctx);
+        // Protect fi_senddata call with endpoint submission mutex
+        {
+            std::lock_guard<std::mutex> submit_lock(cq_rail_mutex_);
+            ret = fi_senddata(endpoint,
+                              req->buffer,
+                              req->buffer_size,
+                              desc,
+                              req->immediate_data,
+                              req->dest_addr,
+                              &req->ctx);
+        }
 
         if (ret == 0) {
             // Success
@@ -1170,16 +1173,20 @@ nixlLibfabricRail::postWrite(nixlLibfabricReq *req) const {
     int attempt = 0;
 
     while (true) {
-        // Libfabric fi_writedata call
-        ret = fi_writedata(endpoint,
-                           req->local_addr,
-                           req->chunk_size,
-                           local_desc,
-                           req->immediate_data,
-                           req->dest_addr,
-                           req->remote_addr,
-                           req->remote_key,
-                           &req->ctx);
+        // Protect fi_writedata call with endpoint submission mutex
+        // Even with FI_THREAD_SAFE, concurrent submissions can cause corruption
+        {
+            std::lock_guard<std::mutex> submit_lock(cq_rail_mutex_);
+            ret = fi_writedata(endpoint,
+                               req->local_addr,
+                               req->chunk_size,
+                               local_desc,
+                               req->immediate_data,
+                               req->dest_addr,
+                               req->remote_addr,
+                               req->remote_key,
+                               &req->ctx);
+        }
 
         if (ret == 0) {
             // Success
@@ -1245,15 +1252,18 @@ nixlLibfabricRail::postRead(nixlLibfabricReq *req) const {
     int attempt = 0;
 
     while (true) {
-        // Libfabric fi_read call
-        ret = fi_read(endpoint,
-                      req->local_addr,
-                      req->chunk_size,
-                      local_desc,
-                      req->dest_addr,
-                      req->remote_addr,
-                      req->remote_key,
-                      &req->ctx);
+        // Protect fi_read call with endpoint submission mutex
+        {
+            std::lock_guard<std::mutex> submit_lock(cq_rail_mutex_);
+            ret = fi_read(endpoint,
+                          req->local_addr,
+                          req->chunk_size,
+                          local_desc,
+                          req->dest_addr,
+                          req->remote_addr,
+                          req->remote_key,
+                          &req->ctx);
+        }
 
         if (ret == 0) {
             // Success
