@@ -583,9 +583,15 @@ nixl_status_t
 nixlLibfabricRailManager::progressActiveDataRails() {
     std::vector<size_t> rails_to_process;
 
-    // Copy active rails under lock to avoid iterator invalidation
+    // Try to acquire lock without blocking to avoid convoy effect with multiple threads
     {
-        std::lock_guard<std::mutex> lock(active_rails_mutex_);
+        std::unique_lock<std::mutex> lock(active_rails_mutex_, std::try_to_lock);
+        if (!lock.owns_lock()) {
+            // Another thread is already progressing active rails, let them handle it
+            NIXL_TRACE << "Active rails locked by another thread, returning IN_PROG";
+            return NIXL_IN_PROG;
+        }
+        
         if (active_rails_.empty()) {
             return NIXL_IN_PROG; // No active rails to process
         }

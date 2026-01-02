@@ -379,6 +379,10 @@ private:
 
     // CQ progress mutex to protect completion queue operations
     mutable std::mutex cq_progress_mutex_;
+    
+    // Endpoint submission mutex to protect fi_writedata/fi_senddata/fi_read calls
+    // Even with FI_THREAD_SAFE, concurrent submissions can cause corruption
+    mutable std::mutex ep_submission_mutex_;
 
     // Callback functions
     std::function<void(const std::string &)> notificationCallback;
