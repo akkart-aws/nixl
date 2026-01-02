@@ -1083,14 +1083,17 @@ nixlLibfabricRail::postSend(nixlLibfabricReq *req) const {
     int attempt = 0;
 
     while (true) {
-        // Libfabric fi_senddata call
-        ret = fi_senddata(endpoint,
-                          req->buffer,
-                          req->buffer_size,
-                          desc,
-                          req->immediate_data,
-                          req->dest_addr,
-                          &req->ctx);
+        // Protect fi_senddata call with endpoint submission mutex
+        {
+            std::lock_guard<std::mutex> submit_lock(ep_submission_mutex_);
+            ret = fi_senddata(endpoint,
+                              req->buffer,
+                              req->buffer_size,
+                              desc,
+                              req->immediate_data,
+                              req->dest_addr,
+                              &req->ctx);
+        }
 
         if (ret == 0) {
             // Success
@@ -1157,16 +1160,20 @@ nixlLibfabricRail::postWrite(nixlLibfabricReq *req) const {
     int attempt = 0;
 
     while (true) {
-        // Libfabric fi_writedata call
-        ret = fi_writedata(endpoint,
-                           req->local_addr,
-                           req->chunk_size,
-                           local_desc,
-                           req->immediate_data,
-                           req->dest_addr,
-                           req->remote_addr,
-                           req->remote_key,
-                           &req->ctx);
+        // Protect fi_writedata call with endpoint submission mutex
+        // Even with FI_THREAD_SAFE, concurrent submissions can cause corruption
+        {
+            std::lock_guard<std::mutex> submit_lock(ep_submission_mutex_);
+            ret = fi_writedata(endpoint,
+                               req->local_addr,
+                               req->chunk_size,
+                               local_desc,
+                               req->immediate_data,
+                               req->dest_addr,
+                               req->remote_addr,
+                               req->remote_key,
+                               &req->ctx);
+        }
 
         if (ret == 0) {
             // Success
@@ -1232,15 +1239,18 @@ nixlLibfabricRail::postRead(nixlLibfabricReq *req) const {
     int attempt = 0;
 
     while (true) {
-        // Libfabric fi_read call
-        ret = fi_read(endpoint,
-                      req->local_addr,
-                      req->chunk_size,
-                      local_desc,
-                      req->dest_addr,
-                      req->remote_addr,
-                      req->remote_key,
-                      &req->ctx);
+        // Protect fi_read call with endpoint submission mutex
+        {
+            std::lock_guard<std::mutex> submit_lock(ep_submission_mutex_);
+            ret = fi_read(endpoint,
+                          req->local_addr,
+                          req->chunk_size,
+                          local_desc,
+                          req->dest_addr,
+                          req->remote_addr,
+                          req->remote_key,
+                          &req->ctx);
+        }
 
         if (ret == 0) {
             // Success
