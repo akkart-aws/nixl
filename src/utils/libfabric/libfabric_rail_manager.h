@@ -312,9 +312,9 @@ private:
     // EFA device to rail mapping
     std::unordered_map<std::string, size_t> efa_device_to_rail_map;
 
-    // Active Rail Tracking System
-    std::unordered_set<size_t> active_rails_;
-    mutable std::mutex active_rails_mutex_;
+    // Active Rail Tracking System - Lock-free atomic bitset
+    // Supports up to 64 rails (one bit per rail)
+    std::atomic<uint64_t> active_rails_bitset_{0};
 
     // Internal rail selection method
     std::vector<size_t>
