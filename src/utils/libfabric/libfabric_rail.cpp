@@ -24,6 +24,8 @@
 #include <cstring>
 #include <stdexcept>
 #include <stack>
+#include <thread>
+#include <limits>
 
 // RequestPool Base Class Implementation
 
@@ -371,7 +373,9 @@ DataRequestPool::expandPool() {
 
 nixlLibfabricReq *
 DataRequestPool::allocate(nixlLibfabricReq::OpType op_type, uint32_t req_id) {
-    // Use common allocation logic from base class
+    // Mutex needed because progress thread can release to this pool concurrently
+    // However, there's NO CONTENTION because only the owning thread allocates
+    // The mutex just protects the free_indices_ stack from concurrent release operations
     nixlLibfabricReq *req = allocateReq(req_id);
     if (req) {
         // Set the operation type specific to data requests
@@ -382,15 +386,19 @@ DataRequestPool::allocate(nixlLibfabricReq::OpType op_type, uint32_t req_id) {
 
 // Rail Class Implementation
 
+// Thread-local storage for thread ID
+thread_local size_t nixlLibfabricRail::tls_thread_id_ = nixlLibfabricRail::UNASSIGNED;
+
 nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
                                      const std::string &provider,
-                                     uint16_t id)
+                                     uint16_t id,
+                                     size_t num_threads)
     : rail_id(id),
       device_name(device),
       provider_name(provider),
       blocking_cq_sread_supported(true),
-      control_request_pool_(NIXL_LIBFABRIC_CONTROL_REQUESTS_PER_RAIL, id),
-      data_request_pool_(NIXL_LIBFABRIC_DATA_REQUESTS_PER_RAIL, id),
+      next_thread_id_(0),
+      num_threads_(num_threads),
       provider_supports_hmem_(false) {
     // Initialize all pointers to nullptr
     info = nullptr;
@@ -569,28 +577,53 @@ nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
             throw std::runtime_error("fi_getname failed for rail " + std::to_string(rail_id));
         }
 
-        // Initialize control request pool with buffers
-        nixl_status_t status = control_request_pool_.initialize(domain);
-        if (status != NIXL_SUCCESS) {
-            throw std::runtime_error("Failed to initialize control request pool for rail " +
-                                     std::to_string(rail_id));
-        }
-        // Initialize data request pool
-        status = data_request_pool_.initialize();
-        if (status != NIXL_SUCCESS) {
-            throw std::runtime_error("Failed to initialize data request pool for rail " +
-                                     std::to_string(rail_id));
+        // Pre-allocate per-thread control pools (partitioned)
+        size_t control_requests_per_thread =
+            NIXL_LIBFABRIC_CONTROL_REQUESTS_PER_RAIL / num_threads_;
+        if (control_requests_per_thread == 0) {
+            control_requests_per_thread = 1; // Ensure at least 1 request per thread
         }
 
-        NIXL_TRACE << "Initialized request pools: " << NIXL_LIBFABRIC_CONTROL_REQUESTS_PER_RAIL
-                   << " control requests, " << NIXL_LIBFABRIC_DATA_REQUESTS_PER_RAIL
-                   << " data requests for rail " << rail_id;
+        NIXL_INFO << "Pre-allocating " << num_threads_ << " per-thread control pools with "
+                  << control_requests_per_thread << " requests each for rail " << rail_id;
+
+        per_thread_control_pools_.reserve(num_threads_);
+        for (size_t i = 0; i < num_threads_; ++i) {
+            auto control_pool =
+                std::make_unique<ControlRequestPool>(control_requests_per_thread, rail_id);
+            nixl_status_t status = control_pool->initialize(domain);
+            if (status != NIXL_SUCCESS) {
+                throw std::runtime_error("Failed to initialize control request pool for thread " +
+                                         std::to_string(i) + " on rail " + std::to_string(rail_id));
+            }
+            per_thread_control_pools_.push_back(std::move(control_pool));
+        }
+
+        // Pre-allocate per-thread data pools (full allocation per thread)
+        NIXL_INFO << "Pre-allocating " << num_threads_ << " per-thread data pools with "
+                  << NIXL_LIBFABRIC_DATA_REQUESTS_PER_RAIL << " requests each for rail " << rail_id;
+
+        per_thread_data_pools_.reserve(num_threads_);
+        for (size_t i = 0; i < num_threads_; ++i) {
+            auto data_pool =
+                std::make_unique<DataRequestPool>(NIXL_LIBFABRIC_DATA_REQUESTS_PER_RAIL, rail_id);
+            nixl_status_t status = data_pool->initialize();
+            if (status != NIXL_SUCCESS) {
+                throw std::runtime_error("Failed to initialize data request pool for thread " +
+                                         std::to_string(i) + " on rail " + std::to_string(rail_id));
+            }
+            per_thread_data_pools_.push_back(std::move(data_pool));
+        }
+
+        NIXL_INFO << "Successfully pre-allocated " << num_threads_ << " control pools and "
+                  << num_threads_ << " data pools for rail " << rail_id;
 
         // Post initial pool of receives using new resource management system
         NIXL_INFO << "Pre-posting " << NIXL_LIBFABRIC_RECV_POOL_SIZE << " recv requests for rail "
                   << rail_id;
 
         for (size_t i = 0; i < NIXL_LIBFABRIC_RECV_POOL_SIZE; ++i) {
+            // Thread ID is automatically determined by getThreadId()
             nixlLibfabricReq *recv_req = allocateControlRequest(
                 NIXL_LIBFABRIC_SEND_RECV_BUFFER_SIZE, LibfabricUtils::getNextXferId());
             if (!recv_req) {
@@ -598,8 +631,8 @@ nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
                 throw std::runtime_error("Failed to allocate request for recv pool on rail " +
                                          std::to_string(rail_id));
             }
-            status = postRecv(recv_req);
-            if (status != NIXL_SUCCESS) {
+            nixl_status_t recv_status = postRecv(recv_req);
+            if (recv_status != NIXL_SUCCESS) {
                 NIXL_ERROR << "Failed to post recv " << i << " on rail " << rail_id;
                 releaseRequest(recv_req);
                 throw std::runtime_error("Failed to post recv pool on rail " +
@@ -664,7 +697,22 @@ nixlLibfabricRail::cleanup() {
     // STEP 3: Clean up request pools while domain is still valid
     // This ensures all memory registrations (MRs) are properly deregistered before domain closure
     NIXL_TRACE << "Cleaning up request pools for rail " << rail_id;
-    control_request_pool_.cleanup();
+
+    // Clean up all per-thread control pools
+    NIXL_DEBUG << "Cleaning up " << per_thread_control_pools_.size()
+               << " per-thread control pools for rail " << rail_id;
+    for (auto &pool : per_thread_control_pools_) {
+        if (pool) {
+            pool->cleanup();
+        }
+    }
+    per_thread_control_pools_.clear();
+
+    // Clean up all per-thread data pools
+    NIXL_DEBUG << "Cleaning up " << per_thread_data_pools_.size()
+               << " per-thread data pools for rail " << rail_id;
+    per_thread_data_pools_.clear(); // Calls destructors automatically
+
     // STEP 4: Close domain AFTER all MRs, endpoint, CQ, AV are closed
     if (domain) {
         NIXL_TRACE << "Closing domain for rail " << rail_id;
@@ -980,6 +1028,7 @@ nixlLibfabricRail::processRecvCompletion(struct fi_cq_data_entry *comp) const {
     releaseRequest(req);
 
     // Post a new receive using new resource management system
+    // Thread ID is automatically determined by getThreadId()
     nixlLibfabricReq *new_req = allocateControlRequest(NIXL_LIBFABRIC_SEND_RECV_BUFFER_SIZE,
                                                        LibfabricUtils::getNextXferId());
     if (!new_req) {
@@ -1472,14 +1521,65 @@ nixlLibfabricRail::getMemoryKey(struct fid_mr *mr) const {
 
 // Optimized Resource Management Methods
 
+// Thread ID Management
+size_t
+nixlLibfabricRail::getThreadId() const {
+    // Check if this thread already has an ID assigned
+    if (tls_thread_id_ == UNASSIGNED) {
+        // Assign next available thread ID using round-robin
+        tls_thread_id_ = next_thread_id_.fetch_add(1) % num_threads_;
+
+        NIXL_DEBUG << "Assigned thread ID " << tls_thread_id_ << " to thread "
+                   << std::this_thread::get_id() << " on rail " << rail_id;
+    }
+
+    return tls_thread_id_;
+}
+
 nixlLibfabricReq *
 nixlLibfabricRail::allocateControlRequest(size_t needed_size, uint32_t req_id) const {
-    return const_cast<ControlRequestPool &>(control_request_pool_).allocate(needed_size, req_id);
+    // Get thread ID automatically using thread_local storage
+    size_t thread_id = getThreadId();
+
+    // Validate thread_id
+    if (thread_id >= num_threads_) {
+        NIXL_ERROR << "Invalid thread_id " << thread_id << " (num_threads=" << num_threads_
+                   << ") for control request allocation on rail " << rail_id;
+        return nullptr;
+    }
+
+    // Allocate from the thread's dedicated control pool
+    nixlLibfabricReq *req = per_thread_control_pools_[thread_id]->allocate(needed_size, req_id);
+    if (req) {
+        req->thread_id = thread_id;
+        NIXL_TRACE << "Allocated control request XFER_ID=" << req_id << " from thread " << thread_id
+                   << " pool on rail " << rail_id;
+    }
+
+    return req;
 }
 
 nixlLibfabricReq *
 nixlLibfabricRail::allocateDataRequest(nixlLibfabricReq::OpType op_type, uint32_t req_id) const {
-    return const_cast<DataRequestPool &>(data_request_pool_).allocate(op_type, req_id);
+    // Get thread ID automatically using thread_local storage
+    size_t thread_id = getThreadId();
+
+    // Validate thread_id
+    if (thread_id >= num_threads_) {
+        NIXL_ERROR << "Invalid thread_id " << thread_id << " (num_threads=" << num_threads_
+                   << ") for data request allocation on rail " << rail_id;
+        return nullptr;
+    }
+
+    // Allocate from the thread's dedicated data pool (no contention!)
+    nixlLibfabricReq *req = per_thread_data_pools_[thread_id]->allocate(op_type, req_id);
+    if (req) {
+        req->thread_id = thread_id;
+        NIXL_TRACE << "Allocated data request XFER_ID=" << req_id << " from thread " << thread_id
+                   << " pool on rail " << rail_id;
+    }
+
+    return req;
 }
 
 void
@@ -1489,12 +1589,25 @@ nixlLibfabricRail::releaseRequest(nixlLibfabricReq *req) const {
         return;
     }
 
+    // Validate thread_id
+    if (req->thread_id >= num_threads_) {
+        NIXL_ERROR << "Invalid thread_id " << req->thread_id
+                   << " in request XFER_ID=" << req->xfer_id << " on rail " << rail_id;
+        return;
+    }
+
     // Determine which pool to release to based on operation type
     if (req->operation_type == nixlLibfabricReq::SEND ||
         req->operation_type == nixlLibfabricReq::RECV) {
-        control_request_pool_.release(req);
+        // Control request: Release to the thread's control pool
+        per_thread_control_pools_[req->thread_id]->release(req);
+        NIXL_TRACE << "Released control request XFER_ID=" << req->xfer_id << " to thread "
+                   << req->thread_id << " control pool on rail " << rail_id;
     } else {
-        data_request_pool_.release(req);
+        // Data request: Release to the thread's data pool
+        per_thread_data_pools_[req->thread_id]->release(req);
+        NIXL_TRACE << "Released data request XFER_ID=" << req->xfer_id << " to thread "
+                   << req->thread_id << " data pool on rail " << rail_id;
     }
 }
 
@@ -1504,18 +1617,13 @@ nixlLibfabricRail::findRequestFromContext(void *context) const {
         NIXL_ERROR << "Null context provided to findRequestFromContext on rail " << rail_id;
         return nullptr;
     }
-    // Try control pool first
-    nixlLibfabricReq *req = control_request_pool_.findByContext(context);
-    if (req) {
-        return req;
-    }
-    // Try data pool
-    req = data_request_pool_.findByContext(context);
-    if (req) {
-        return req;
-    }
-    NIXL_ERROR << "No request found for context " << context << " on rail " << rail_id;
-    return nullptr;
+
+    // Direct cast - fi_context is the first member of nixlLibfabricReq
+    // This is O(1) with zero overhead - no need to search pools!
+    nixlLibfabricReq *req = reinterpret_cast<nixlLibfabricReq *>(context);
+
+    NIXL_TRACE << "From context the request xfer_id is : " << req->xfer_id;
+    return req;
 }
 
 fi_info *

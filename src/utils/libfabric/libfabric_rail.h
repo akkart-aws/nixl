@@ -25,6 +25,8 @@
 #include <mutex>
 #include <ostream>
 #include <stack>
+#include <atomic>
+#include <limits>
 
 #include "nixl.h"
 #include "backend/backend_aux.h"
@@ -59,6 +61,8 @@ struct nixlLibfabricReq {
     uint64_t immediate_data; ///< Immediate data for write/send operations
     fi_addr_t dest_addr; ///< Destination libfabric address
 
+    size_t thread_id; ///< Thread ID that owns this request (for thread-safe release)
+
     /** Default constructor initializing all fields */
     nixlLibfabricReq()
         : rail_id(0),
@@ -76,7 +80,8 @@ struct nixlLibfabricReq {
           local_mr(nullptr),
           remote_key(0),
           immediate_data(0),
-          dest_addr(FI_ADDR_UNSPEC) {
+          dest_addr(FI_ADDR_UNSPEC),
+          thread_id(0) {
         memset(&ctx, 0, sizeof(fi_context));
     }
 };
@@ -254,8 +259,11 @@ public:
     char ep_name[LF_EP_NAME_MAX_LEN]; ///< Endpoint name for connection setup
     mutable bool blocking_cq_sread_supported; ///< Whether blocking CQ reads are supported
 
-    /** Initialize libfabric rail with all resources */
-    nixlLibfabricRail(const std::string &device, const std::string &provider, uint16_t id);
+    /** Initialize libfabric rail with all resources and per-thread pools */
+    nixlLibfabricRail(const std::string &device,
+                      const std::string &provider,
+                      uint16_t id,
+                      size_t num_threads = 1);
 
     /** Destroy rail and cleanup all libfabric resources */
     ~nixlLibfabricRail();
@@ -349,11 +357,11 @@ public:
     setXferIdCallback(std::function<void(uint32_t)> callback);
 
     // Optimized resource management methods
-    /** Allocate control request with size validation */
+    /** Allocate control request with size validation (thread_id determined automatically) */
     [[nodiscard]] nixlLibfabricReq *
     allocateControlRequest(size_t needed_size, uint32_t req_id) const;
 
-    /** Allocate data request for specified operation */
+    /** Allocate data request for specified operation (thread_id determined automatically) */
     [[nodiscard]] nixlLibfabricReq *
     allocateDataRequest(nixlLibfabricReq::OpType op_type, uint32_t req_id) const;
 
@@ -369,6 +377,15 @@ public:
     getRailInfo() const;
 
 private:
+    // Thread ID management for automatic per-thread pool selection
+    static thread_local size_t tls_thread_id_; ///< Thread-local ID (UNASSIGNED until first use)
+    mutable std::atomic<size_t> next_thread_id_; ///< Atomic counter for thread ID assignment
+    static constexpr size_t UNASSIGNED = std::numeric_limits<size_t>::max();
+
+    /** Get thread ID for current thread (lazy TLS initialization with round-robin assignment) */
+    size_t
+    getThreadId() const;
+
     // Core libfabric resources
     struct fi_info *info; // from rail_infos[rail_id]
     struct fid_fabric *fabric; // from rail_fabrics[rail_id]
@@ -392,9 +409,10 @@ private:
     // XFER_ID tracking callback
     std::function<void(uint32_t)> xferIdCallback;
 
-    // Separate request pools for optimal performance
-    ControlRequestPool control_request_pool_;
-    DataRequestPool data_request_pool_;
+    // Per-thread request pools for zero-contention allocation
+    std::vector<std::unique_ptr<ControlRequestPool>> per_thread_control_pools_;
+    std::vector<std::unique_ptr<DataRequestPool>> per_thread_data_pools_;
+    size_t num_threads_;
 
     // Provider capability flags
     bool provider_supports_hmem_;

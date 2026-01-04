@@ -47,6 +47,14 @@ public:
     /** Destroy rail manager and cleanup all resources */
     ~nixlLibfabricRailManager();
 
+    /** Set number of worker threads for per-thread pool allocation
+     * @param num_workers Number of worker threads
+     */
+    void
+    setNumWorkers(size_t num_workers) {
+        num_workers_ = num_workers;
+    }
+
     // Rail management
     /** Create data rails for high-bandwidth transfers (one per EFA device)
      * @param efa_devices List of EFA device names to create rails on
@@ -173,6 +181,8 @@ public:
      * @param completion_callback Callback for completion notification
      * @param submitted_count_out Number of requests successfully submitted
      * @return NIXL_SUCCESS on success, error code on failure
+     * @note Thread ID is automatically determined by rail's getThreadId() using thread_local
+     * storage
      */
     nixl_status_t
     postDataRequest(nixlLibfabricReq::OpType op_type,
@@ -301,6 +311,7 @@ public:
 
 private:
     size_t striping_threshold_;
+    size_t num_workers_; // Number of worker threads for per-thread pool allocation
 
     // Rail allocation
     std::vector<std::unique_ptr<nixlLibfabricRail>> data_rails_;

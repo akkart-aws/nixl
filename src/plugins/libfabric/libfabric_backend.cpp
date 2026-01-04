@@ -247,6 +247,22 @@ nixlLibfabricEngine::nixlLibfabricEngine(const nixlBackendInitParams *init_param
 
     NIXL_DEBUG << "Initializing Libfabric Backend with GPU Support";
 
+    // Extract num_workers from backend parameters (similar to UCX backend)
+    std::string num_workers_str;
+    size_t num_workers = 1; // Default to 1 if not specified
+    if (getInitParam("num_workers", num_workers_str) == NIXL_SUCCESS) {
+        try {
+            num_workers = std::stoull(num_workers_str);
+            NIXL_INFO << "Using num_workers=" << num_workers << " for per-thread pool allocation";
+        }
+        catch (const std::exception &e) {
+            NIXL_WARN << "Invalid num_workers value '" << num_workers_str
+                      << "', using default: " << num_workers;
+        }
+    } else {
+        NIXL_DEBUG << "num_workers not specified, using default: " << num_workers;
+    }
+
 #ifdef HAVE_CUDA
     // Initialize CUDA context management
     vramInitCtx();
@@ -279,8 +295,12 @@ nixlLibfabricEngine::nixlLibfabricEngine(const nixlBackendInitParams *init_param
 
     // Initialize Rail Manager which will discover the topology and create all rails.
     try {
+        // Pass num_workers to rail manager for per-thread pool allocation
+        rail_manager.setNumWorkers(num_workers);
+
         NIXL_DEBUG << "Rail Manager created with " << rail_manager.getNumDataRails()
-                   << " data rails and " << rail_manager.getNumControlRails() << " control rails";
+                   << " data rails and " << rail_manager.getNumControlRails() << " control rails"
+                   << " (num_workers=" << num_workers << ")";
 
         // Set up callbacks on each rail using Engine's static callback functions
         size_t control_rail_id = 0;
@@ -1077,6 +1097,9 @@ nixlLibfabricEngine::postXfer(const nixl_xfer_op_t &operation,
         // Use descriptor's specific target address
         uint64_t remote_target_addr = remote[desc_idx].addr;
 
+        // Note: thread_id is automatically determined by rail's getThreadId() method
+        // which uses thread_local storage and atomic round-robin assignment
+        // This works with any threading model (OpenMP, std::thread, pthread, etc.)
         size_t submitted_count = 0;
         nixl_status_t status = rail_manager.postDataRequest(
             op_type,

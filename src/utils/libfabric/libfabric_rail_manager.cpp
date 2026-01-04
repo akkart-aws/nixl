@@ -38,9 +38,10 @@ static std::atomic<size_t> round_robin_counter{0};
 static const std::string NUM_RAILS_TAG{"num_rails"};
 
 nixlLibfabricRailManager::nixlLibfabricRailManager(size_t striping_threshold)
-    : striping_threshold_(striping_threshold) {
+    : striping_threshold_(striping_threshold),
+      num_workers_(1) {
     NIXL_DEBUG << "Creating rail manager with striping threshold: " << striping_threshold_
-               << " bytes";
+               << " bytes (num_workers will be set by backend)";
 
     // Initialize topology system
     topology = std::make_unique<nixlLibfabricTopology>();
@@ -90,8 +91,9 @@ nixlLibfabricRailManager::createDataRails(const std::vector<std::string> &efa_de
         data_rails_.reserve(num_data_rails_);
 
         for (size_t i = 0; i < num_data_rails_; ++i) {
+            // Use num_workers_ for per-thread pool allocation
             data_rails_.emplace_back(std::make_unique<nixlLibfabricRail>(
-                efa_devices[i], provider_name, static_cast<uint16_t>(i)));
+                efa_devices[i], provider_name, static_cast<uint16_t>(i), num_workers_));
 
             // Initialize EFA device mapping
             efa_device_to_rail_map[efa_devices[i]] = i;
@@ -120,8 +122,9 @@ nixlLibfabricRailManager::createControlRails(const std::vector<std::string> &efa
         control_rails_.reserve(num_control_rails_);
 
         for (size_t i = 0; i < num_control_rails_; ++i) {
+            // Control rails use single thread (thread 0) for control messages
             control_rails_.emplace_back(std::make_unique<nixlLibfabricRail>(
-                efa_devices[i], provider_name, static_cast<uint16_t>(i)));
+                efa_devices[i], provider_name, static_cast<uint16_t>(i), 1));
             NIXL_DEBUG << "Created control rail " << i << " (device=" << efa_devices[i]
                        << ", provider=" << provider_name << ")";
         }
@@ -199,7 +202,8 @@ nixlLibfabricRailManager::postDataRequest(
             chunk_size + (use_striping && i == num_rails - 1 ? remainder : 0);
 
         if (current_chunk_size == 0) break;
-        // Allocate request
+        // Allocate request - thread_id is automatically determined by rail's getThreadId()
+        // which uses thread_local storage and atomic round-robin assignment
         nixlLibfabricReq *req = data_rails_[rail_id]->allocateDataRequest(op_type, xfer_id);
         if (!req) {
             NIXL_ERROR << "Failed to allocate request for rail " << rail_id;
