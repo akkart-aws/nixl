@@ -58,6 +58,8 @@ struct nixlLibfabricReq {
     uint64_t remote_key; ///< Remote access key for transfers
     uint64_t immediate_data; ///< Immediate data for write/send operations
     fi_addr_t dest_addr; ///< Destination libfabric address
+    
+    void* owning_pool; ///< Pool that allocated this request (DataRequestPool* for thread-safe release)
 
     /** Default constructor initializing all fields */
     nixlLibfabricReq()
@@ -76,7 +78,8 @@ struct nixlLibfabricReq {
           local_mr(nullptr),
           remote_key(0),
           immediate_data(0),
-          dest_addr(FI_ADDR_UNSPEC) {
+          dest_addr(FI_ADDR_UNSPEC),
+          owning_pool(nullptr) {
         memset(&ctx, 0, sizeof(fi_context));
     }
 };
@@ -394,7 +397,13 @@ private:
 
     // Separate request pools for optimal performance
     ControlRequestPool control_request_pool_;
-    DataRequestPool data_request_pool_;
+    
+    // Per-thread data pools for zero-contention allocation
+    mutable std::vector<std::unique_ptr<DataRequestPool>> per_thread_data_pools_;
+    mutable std::mutex data_pool_creation_mutex_;  // Only for pool creation (cold path)
+    
+    // Helper to get thread's data pool (lazy initialization)
+    DataRequestPool* getThreadDataPool() const;
 
     // Provider capability flags
     bool provider_supports_hmem_;
