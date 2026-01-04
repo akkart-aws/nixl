@@ -20,6 +20,7 @@ libfabric_utils_sources = files(
     'libfabric_rail_manager.cpp',
     'libfabric_common.cpp',
     'libfabric_topology.cpp',
+    'lock_free_stack.cpp',
     # More implementation files will be added as we create them
 )
 
@@ -29,6 +30,7 @@ libfabric_utils_headers = files(
     'libfabric_rail_manager.h',
     'libfabric_common.h',
     'libfabric_topology.h',
+    'lock_free_stack.h',
 )
 
 # Find hwloc dependency

@@ -20,10 +20,12 @@
 #include "common/nixl_log.h"
 #include "serdes/serdes.h"
 #include "libfabric_common.h"
+#include "lock_free_stack.h"
 
 #include <cstring>
 #include <stdexcept>
-#include <stack>
+#include <thread>
+#include <limits>
 
 // RequestPool Base Class Implementation
 
@@ -41,8 +43,13 @@ RequestPool::initializeBasePool(size_t pool_size) {
     for (size_t i = current_size; i < requests_.size(); ++i) {
         requests_[i].rail_id = rail_id_;
         requests_[i].pool_index = i; // Set the pool index for deque compatibility
-        requests_[i].in_use = false;
-        free_indices_.push(i);
+        requests_[i].in_use.store(false, std::memory_order_relaxed);
+        
+        // Push to lock-free stack
+        if (!free_indices_.push(i)) {
+            NIXL_ERROR << "Failed to push index " << i << " to free_indices_ on rail " << rail_id_;
+            throw std::runtime_error("Failed to initialize request pool");
+        }
     }
 
     NIXL_INFO << "InitializeBasePool - Rail " << rail_id_
@@ -57,10 +64,11 @@ RequestPool::release(nixlLibfabricReq *req) const {
         return;
     }
 
-    std::lock_guard<std::mutex> lock(pool_mutex_);
-
-    // GUARD: Check if already released
-    if (!req->in_use) {
+    // GUARD: Check if already released using atomic compare-exchange
+    bool expected_in_use = true;
+    if (!req->in_use.compare_exchange_strong(expected_in_use, false,
+                                              std::memory_order_release,
+                                              std::memory_order_relaxed)) {
         NIXL_WARN << "Attempt to double-release request XFER_ID=" << req->xfer_id << " on rail "
                   << rail_id_ << " - ignoring to prevent corruption";
         return;
@@ -69,7 +77,7 @@ RequestPool::release(nixlLibfabricReq *req) const {
     NIXL_TRACE << "ReleaseReq on Rail " << rail_id_ << " releasing request XFER_ID=" << req->xfer_id
                << " pool_index=" << req->pool_index;
 
-    req->in_use = false;
+    // Clear request fields
     req->xfer_id = 0;
     req->chunk_offset = 0;
     req->chunk_size = 0;
@@ -86,19 +94,21 @@ RequestPool::release(nixlLibfabricReq *req) const {
         return;
     }
 
-    free_indices_.push(idx);
+    // Lock-free push to free indices stack
+    if (!free_indices_.push(idx)) {
+        NIXL_ERROR << "Failed to push index " << idx << " back to free_indices_ on rail " << rail_id_;
+    }
 }
 
 nixlLibfabricReq *
 RequestPool::findByContext(void *context) const {
-    std::lock_guard<std::mutex> lock(pool_mutex_);
-
     if (!context) {
         return nullptr;
     }
 
-    // Since fi_context2 ctx is the first member of nixlLibfabricReq,
+    // Since fi_context ctx is the first member of nixlLibfabricReq,
     // we can directly cast the context pointer to the request pointer
+    // No lock needed - this is a read-only operation on stable memory
     nixlLibfabricReq *req = reinterpret_cast<nixlLibfabricReq *>(context);
 
     NIXL_TRACE << "From context the request xfer_id is : " << req->xfer_id;
@@ -107,47 +117,71 @@ RequestPool::findByContext(void *context) const {
 
 size_t
 RequestPool::getActiveRequestCount() const {
-    std::lock_guard<std::mutex> lock(pool_mutex_);
+    // Lock-free size query (approximate, may be stale)
     return requests_.size() - free_indices_.size();
 }
 
 size_t
 RequestPool::getPoolUtilization() const {
-    std::lock_guard<std::mutex> lock(pool_mutex_);
-    return ((requests_.size() - free_indices_.size()) * 100) / requests_.size();
+    // Lock-free utilization query (approximate, may be stale)
+    size_t total = requests_.size();
+    if (total == 0) return 0;
+    return ((total - free_indices_.size()) * 100) / total;
 }
 
 nixlLibfabricReq *
 RequestPool::allocateReq(uint32_t req_id) {
-    std::lock_guard<std::mutex> lock(pool_mutex_);
+    size_t idx;
+    
+    // Try to pop from lock-free stack
+    if (!free_indices_.pop(idx)) {
+        // Stack is empty, need to expand pool
+        // Use mutex only for expansion (cold path)
+        std::lock_guard<std::mutex> lock(expansion_mutex_);
+        
+        // Double-check after acquiring lock (another thread may have expanded)
+        if (!free_indices_.pop(idx)) {
+            size_t old_size = requests_.size();
 
-    if (free_indices_.empty()) {
-        size_t old_size = requests_.size();
+            // Try to expand the pool using the derived class implementation
+            nixl_status_t expand_status = expandPool();
+            if (expand_status != NIXL_SUCCESS) {
+                NIXL_ERROR << "AllocateReq on Rail " << rail_id_
+                           << " failed to expand pool, status=" << expand_status;
+                return nullptr;
+            }
 
-        // Try to expand the pool using the derived class implementation
-        nixl_status_t expand_status = expandPool();
-        if (expand_status != NIXL_SUCCESS) {
-            NIXL_ERROR << "AllocateReq on Rail " << rail_id_
-                       << " failed to expand pool, status=" << expand_status;
-            return nullptr;
+            // Check if expansion provided new requests
+            if (!free_indices_.pop(idx)) {
+                NIXL_ERROR << "AllocateReq on Rail " << rail_id_
+                           << " pool still exhausted after expansion";
+                return nullptr;
+            }
+
+            NIXL_INFO << "AllocateReq on Rail " << rail_id_ << " successfully expanded pool from "
+                      << old_size << " to " << requests_.size() << " requests";
         }
-
-        // Check if expansion provided new requests
-        if (free_indices_.empty()) {
-            NIXL_ERROR << "AllocateReq on Rail " << rail_id_
-                       << " pool still exhausted after expansion";
-            return nullptr;
-        }
-
-        NIXL_INFO << "AllocateReq on Rail " << rail_id_ << " successfully expanded pool from "
-                  << old_size << " to " << requests_.size() << " requests";
     }
 
-    size_t idx = free_indices_.top();
-    free_indices_.pop();
+    // Validate index
+    if (idx >= requests_.size()) {
+        NIXL_ERROR << "AllocateReq on Rail " << rail_id_ << " invalid index " << idx
+                   << " from free_indices_ (pool size=" << requests_.size() << ")";
+        return nullptr;
+    }
 
     nixlLibfabricReq *req = &requests_[idx];
-    req->in_use = true;
+    
+    // Atomically mark as in-use
+    bool expected_free = false;
+    if (!req->in_use.compare_exchange_strong(expected_free, true,
+                                              std::memory_order_acquire,
+                                              std::memory_order_relaxed)) {
+        NIXL_ERROR << "AllocateReq on Rail " << rail_id_ << " request at index " << idx
+                   << " was already in use - possible corruption!";
+        return nullptr;
+    }
+    
     req->xfer_id = req_id;
 
     return req;

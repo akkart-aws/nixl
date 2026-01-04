@@ -24,11 +24,12 @@
 #include <functional>
 #include <mutex>
 #include <ostream>
-#include <stack>
+#include <atomic>
 
 #include "nixl.h"
 #include "backend/backend_aux.h"
 #include "libfabric/libfabric_common.h"
+#include "libfabric/lock_free_stack.h"
 
 // Forward declarations
 class nixlLibfabricConnection;
@@ -48,7 +49,7 @@ struct nixlLibfabricReq {
 
     enum OpType { WRITE, READ, SEND, RECV } operation_type; ///< Operation type (pre-assigned)
 
-    bool in_use; ///< Pool management flag
+    std::atomic<bool> in_use; ///< Pool management flag (atomic for lock-free operation)
     size_t chunk_offset; ///< Chunk offset for DATA requests
     size_t chunk_size; ///< Chunk size for DATA requests
     std::function<void()> completion_callback; ///< Completion callback function
@@ -130,10 +131,10 @@ protected:
     initializeBasePool(size_t pool_size);
 
     mutable std::deque<nixlLibfabricReq> requests_; ///< Expandable request pool
-    mutable std::stack<size_t> free_indices_; ///< Stack of available request indices
+    mutable LockFreeStack free_indices_; ///< Lock-free stack of available request indices
     size_t rail_id_; ///< Rail ID for this pool
     size_t initial_pool_size_; ///< Original pool size for expansion calculations
-    mutable std::mutex pool_mutex_; ///< Thread safety protection
+    mutable std::mutex expansion_mutex_; ///< Mutex only for pool expansion (cold path)
 };
 
 /** Buffer chunk structure for control request pool */
@@ -394,6 +395,8 @@ private:
 
     // Separate request pools for optimal performance
     ControlRequestPool control_request_pool_;
+    
+    // Shared lock-free data pool (no thread-local needed with lock-free atomics)
     DataRequestPool data_request_pool_;
 
     // Provider capability flags
