@@ -14,6 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Build accelerator abstraction layer first
+subdir('accelerator')
+
 # Source files
 libfabric_utils_sources = files(
     'libfabric_rail.cpp',
@@ -39,6 +42,7 @@ libfabric_utils_deps = [
     libfabric_dep,
     hwloc_dep,
     abseil_proj.get_variable('absl_log_dep'),
+    accelerator_dep,
 ]
 
 libfabric_utils_cpp_args = []

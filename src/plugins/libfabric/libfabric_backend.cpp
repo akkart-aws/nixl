@@ -30,137 +30,6 @@
 #include "absl/strings/numbers.h"
 #include "libfabric/libfabric_topology.h"
 
-#ifdef HAVE_CUDA
-// CUDA error checking macros
-#define CHECK_CUDA_ERROR(result, message)                                                         \
-    do {                                                                                          \
-        if (result != cudaSuccess) {                                                              \
-            NIXL_ERROR << "CUDA Error: " << message << " (" << cudaGetErrorString(result) << ")"; \
-            return NIXL_ERR_BACKEND;                                                              \
-        }                                                                                         \
-    } while (0)
-
-#define CHECK_CUDA_DRIVER_ERROR(result, message)                                        \
-    do {                                                                                \
-        if (result != CUDA_SUCCESS) {                                                   \
-            const char *error_str;                                                      \
-            cuGetErrorString(result, &error_str);                                       \
-            NIXL_ERROR << "CUDA Driver Error: " << message << " (" << error_str << ")"; \
-            return NIXL_ERR_BACKEND;                                                    \
-        }                                                                               \
-    } while (0)
-#endif
-
-/****************************************
- * CUDA Context Management
- *****************************************/
-
-#ifdef HAVE_CUDA
-static int
-cudaQueryAddr(void *address, bool &is_dev, CUdevice &dev, CUcontext &ctx) {
-    CUmemorytype mem_type = CU_MEMORYTYPE_HOST;
-    uint32_t is_managed = 0;
-    CUpointer_attribute attr_type[4];
-    void *attr_data[4];
-    CUresult result;
-
-    attr_type[0] = CU_POINTER_ATTRIBUTE_MEMORY_TYPE;
-    attr_data[0] = &mem_type;
-    attr_type[1] = CU_POINTER_ATTRIBUTE_IS_MANAGED;
-    attr_data[1] = &is_managed;
-    attr_type[2] = CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL;
-    attr_data[2] = &dev;
-    attr_type[3] = CU_POINTER_ATTRIBUTE_CONTEXT;
-    attr_data[3] = &ctx;
-
-    result = cuPointerGetAttributes(4, attr_type, attr_data, (CUdeviceptr)address);
-    is_dev = (mem_type == CU_MEMORYTYPE_DEVICE);
-
-    return (CUDA_SUCCESS != result);
-}
-
-void
-nixlLibfabricCudaCtx::cudaResetCtxPtr() {
-    pthrCudaCtx_ = NULL;
-    myDevId_ = -1;
-}
-
-int
-nixlLibfabricCudaCtx::cudaUpdateCtxPtr(void *address, int expected_dev, bool &was_updated) {
-    bool is_dev;
-    CUdevice dev;
-    CUcontext ctx;
-    int ret;
-
-    was_updated = false;
-
-    if (expected_dev == -1) return -1;
-    if (myDevId_ != -1 && expected_dev != myDevId_) return -1;
-
-    ret = cudaQueryAddr(address, is_dev, dev, ctx);
-    if (ret) return ret;
-    if (!is_dev) return 0;
-    if (dev != expected_dev) return -1;
-
-    if (pthrCudaCtx_) {
-        if (pthrCudaCtx_ != ctx) return -1;
-        return 0;
-    }
-
-    pthrCudaCtx_ = ctx;
-    was_updated = true;
-    myDevId_ = expected_dev;
-
-    return 0;
-}
-
-int
-nixlLibfabricCudaCtx::cudaSetCtx() {
-    CUresult result;
-    if (NULL == pthrCudaCtx_) return 0;
-
-    result = cuCtxSetCurrent(pthrCudaCtx_);
-    return (CUDA_SUCCESS == result);
-}
-
-void
-nixlLibfabricEngine::vramInitCtx() {
-    cudaCtx_ = std::make_unique<nixlLibfabricCudaCtx>();
-}
-
-int
-nixlLibfabricEngine::vramUpdateCtx(void *address, uint64_t devId, bool &restart_reqd) {
-    int ret;
-    bool was_updated;
-
-    restart_reqd = false;
-
-    if (!cuda_addr_wa_) {
-        return 0; // Nothing to do
-    }
-
-    ret = cudaCtx_->cudaUpdateCtxPtr(address, devId, was_updated);
-    if (ret) {
-        return ret;
-    }
-
-    restart_reqd = was_updated;
-    return 0;
-}
-
-int
-nixlLibfabricEngine::vramApplyCtx() {
-    if (!cuda_addr_wa_) {
-        return 0; // Nothing to do
-    }
-    return cudaCtx_->cudaSetCtx();
-}
-
-void
-nixlLibfabricEngine::vramFiniCtx() {
-    cudaCtx_.reset();
-}
-#endif
 
 /****************************************
  * Request Management
@@ -231,20 +100,10 @@ nixlLibfabricEngine::nixlLibfabricEngine(const nixlBackendInitParams *init_param
       progress_thread_delay_(std::chrono::microseconds(init_params->pthrDelay)),
       rail_manager(NIXL_LIBFABRIC_DEFAULT_STRIPING_THRESHOLD) {
 
-    NIXL_DEBUG << "Initializing Libfabric Backend with GPU Support";
+    NIXL_DEBUG << "Initializing Libfabric Backend with Accelerator Support";
 
-#ifdef HAVE_CUDA
-    // Initialize CUDA context management
-    vramInitCtx();
-    // CUDA address workaround
-    if (getenv("NIXL_DISABLE_CUDA_ADDR_WA")) {
-        NIXL_DEBUG << "Disabling CUDA address workaround";
-        cuda_addr_wa_ = false;
-    } else {
-        cuda_addr_wa_ = true;
-        NIXL_DEBUG << "CUDA address workaround enabled";
-    }
-#endif
+    // Note: Accelerator devices (CUDA, Neuron, etc.) will be created on-demand during
+    // memory registration based on the memory type and device topology.
 
     // Parse striping threshold parameter
     std::string threshold_str;
@@ -733,50 +592,70 @@ nixlLibfabricEngine::registerMem(const nixlBlobDesc &mem,
 
     priv->buffer_ = (void *)mem.addr;
     priv->length_ = mem.len;
-    priv->gpu_device_id_ = mem.devId; // Store GPU device ID
+    priv->gpu_device_id_ = mem.devId; // Store device ID
 
-#ifdef HAVE_CUDA
-    // Handle CUDA memory registration with GPU Direct RDMA support
-    if (nixl_mem == VRAM_SEG &&
-        rail_manager.getTopology()->getMrAttrIface(mem.devId) == FI_HMEM_CUDA) {
-        // For multi-GPU support, skip CUDA address workaround
-        if (cuda_addr_wa_) {
-            bool need_restart;
-            if (vramUpdateCtx((void *)mem.addr, mem.devId, need_restart)) {
-                NIXL_WARN << "CUDA address workaround failed for device " << mem.devId
-                          << ", disabling workaround for multi-GPU support";
-                cuda_addr_wa_ = false; // Disable workaround for subsequent registrations
-            } else if (need_restart) {
-                // Restart progress thread if needed
-                NIXL_DEBUG << "CUDA context updated, restarting progress thread";
-                vramApplyCtx();
-            }
-        }
-        // Set CUDA device context directly for multi-GPU support
-        if (!cuda_addr_wa_) {
-            cudaError_t cuda_ret = cudaSetDevice(mem.devId);
-            if (cuda_ret != cudaSuccess) {
-                NIXL_ERROR << "Failed to set CUDA device " << mem.devId << ": "
-                           << cudaGetErrorString(cuda_ret);
+    // Handle accelerator memory registration (CUDA, Neuron, etc.)
+    if (nixl_mem == VRAM_SEG) {
+        fi_hmem_iface iface = rail_manager.getTopology()->getMrAttrIface(mem.devId);
+        
+        // Create accelerator device on-demand if not already created for this device
+        auto it = device_accelerators_.find(mem.devId);
+        if (it == device_accelerators_.end()) {
+            NIXL_DEBUG << "Creating accelerator device for device " << mem.devId
+                       << " with interface type " << iface;
+            
+            auto accelerator = AcceleratorDeviceFactory::create(iface);
+            if (!accelerator) {
+                NIXL_ERROR << "Failed to create accelerator device for interface type " << iface;
                 return NIXL_ERR_NOT_SUPPORTED;
             }
-            NIXL_DEBUG << "Set CUDA device context to GPU " << mem.devId;
+            
+            // Initialize the accelerator device
+            int init_ret = accelerator->initialize(mem.devId);
+            if (init_ret != 0) {
+                NIXL_ERROR << "Failed to initialize accelerator device " << mem.devId;
+                return NIXL_ERR_BACKEND;
+            }
+            
+            device_accelerators_[mem.devId] = std::move(accelerator);
+            it = device_accelerators_.find(mem.devId);
         }
+        
+        AcceleratorDevice* accelerator = it->second.get();
+        
+        // Handle address workaround if needed (CUDA-specific)
+        if (accelerator->needsAddressWorkaround()) {
+            bool need_restart = false;
+            int update_ret = accelerator->updateContext((void *)mem.addr, mem.devId, need_restart);
+            if (update_ret != 0) {
+                NIXL_WARN << "Address workaround failed for device " << mem.devId
+                          << ", disabling workaround";
+                // Disable workaround and fall back to direct device setting
+                accelerator->disableAddressWorkaround();
+            } else if (need_restart) {
+                NIXL_DEBUG << "Context updated, applying context";
+                accelerator->applyContext();
+            }
+        }
+        
+        // Set device context for memory operations
+        if (!accelerator->needsAddressWorkaround()) {
+            int set_ret = accelerator->setDevice(mem.devId);
+            if (set_ret != 0) {
+                NIXL_ERROR << "Failed to set device " << mem.devId;
+                return NIXL_ERR_NOT_SUPPORTED;
+            }
+            NIXL_DEBUG << "Set device context to device " << mem.devId;
+        }
+        
+        // Apply context before libfabric operations
+        accelerator->applyContext();
     }
-#endif
 
     // Initialize vectors to accommodate all possible rails (for indexing consistency)
     priv->rail_mr_list_.resize(rail_manager.getNumDataRails(), nullptr);
     priv->rail_key_list_.clear();
     priv->rail_key_list_.resize(rail_manager.getNumDataRails(), FI_KEY_NOTAVAIL);
-
-#ifdef HAVE_CUDA
-    // Set CUDA context before libfabric operations for VRAM
-    if (nixl_mem == VRAM_SEG &&
-        rail_manager.getTopology()->getMrAttrIface(mem.devId) == FI_HMEM_CUDA) {
-        vramApplyCtx();
-    }
-#endif
 
     // Use Rail Manager for centralized memory registration with GPU Direct RDMA support
     NIXL_TRACE << "Registering memory: addr=" << (void *)mem.addr << " len=" << mem.len
@@ -1582,10 +1461,15 @@ nixlLibfabricEngine::checkPendingNotifications() {
 void
 nixlLibfabricEngine::cleanup() {
     NIXL_DEBUG << "Cleaning up all resources";
-#ifdef HAVE_CUDA
-    // Cleanup CUDA context
-    vramFiniCtx();
-#endif
+    
+    // Finalize all accelerator devices
+    for (auto& [device_id, accelerator] : device_accelerators_) {
+        if (accelerator) {
+            NIXL_DEBUG << "Finalizing accelerator device " << device_id;
+            accelerator->finalize();
+        }
+    }
+    device_accelerators_.clear();
 
     NIXL_DEBUG << "Cleanup all resources complete";
 }

@@ -37,41 +37,10 @@
 
 #include "libfabric/libfabric_rail_manager.h"
 #include "libfabric/libfabric_common.h"
-
-#ifdef HAVE_CUDA
-#include <cuda.h>
-#include <cuda_runtime.h>
-#endif
+#include "libfabric/accelerator/accelerator_device.h"
 
 // Forward declarations
 class nixlLibfabricEngine;
-
-#ifdef HAVE_CUDA
-/** CUDA context management for libfabric backend */
-class nixlLibfabricCudaCtx {
-private:
-    CUcontext pthrCudaCtx_;
-    int myDevId_;
-
-public:
-    nixlLibfabricCudaCtx() {
-        pthrCudaCtx_ = NULL;
-        myDevId_ = -1;
-    }
-
-    /** Reset CUDA context pointer to initial state */
-    void
-    cudaResetCtxPtr();
-
-    /** Update CUDA context pointer for given memory address and device */
-    int
-    cudaUpdateCtxPtr(void *address, int expected_dev, bool &was_updated);
-
-    /** Set the current CUDA context */
-    int
-    cudaSetCtx();
-};
-#endif
 
 /** Private metadata for locally registered memory */
 class nixlLibfabricPrivateMetadata : public nixlBackendMD {
@@ -259,11 +228,10 @@ private:
     // Private notification implementation with unified binary notification system
     nixl_status_t
     notifSendPriv(const std::string &remote_agent, BinaryNotification &binary_notification) const;
-#ifdef HAVE_CUDA
-    // CUDA context management
-    std::unique_ptr<nixlLibfabricCudaCtx> cudaCtx_;
-    bool cuda_addr_wa_; // CUDA address workaround flag
-#endif
+
+    // Accelerator device management
+    // Map of device_id -> accelerator instance for multi-device support
+    std::unordered_map<int, std::unique_ptr<AcceleratorDevice>> device_accelerators_;
 
     // ConnectionManagement thread and completion processing
     nixl_status_t
@@ -291,18 +259,6 @@ private:
                        void *buffer,
                        std::shared_ptr<nixlLibfabricConnection> conn,
                        nixlBackendMD *&output);
-
-#ifdef HAVE_CUDA
-    // CUDA context management methods
-    void
-    vramInitCtx();
-    int
-    vramUpdateCtx(void *address, uint64_t devId, bool &restart_reqd);
-    int
-    vramApplyCtx();
-    void
-    vramFiniCtx();
-#endif
 
 public:
     /** Initialize multi-rail libfabric backend engine */
