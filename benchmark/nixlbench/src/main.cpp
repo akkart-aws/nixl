@@ -213,7 +213,7 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
-    if (worker_ptr->isInitiator() && worker_ptr->isMasterRank()) {
+    if (worker_ptr->isInitiator()) {
         xferBenchConfig::printConfig();
         xferBenchUtils::printStatsHeader();
     }

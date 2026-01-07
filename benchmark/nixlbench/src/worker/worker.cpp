@@ -47,6 +47,11 @@ public:
     }
 
     virtual int
+    broadcastDouble(double *buffer, size_t count, int root_rank) override {
+        return 0;
+    }
+
+    virtual int
     sendChar(char *buffer, size_t count, int dest_rank) override {
         return 0;
     }

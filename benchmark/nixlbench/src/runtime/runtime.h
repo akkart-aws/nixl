@@ -41,6 +41,7 @@ class xferBenchRT {
         virtual int sendInt(int *buffer, int dest_rank) = 0;
         virtual int recvInt(int *buffer, int src_rank) = 0;
         virtual int broadcastInt(int *buffer, size_t count, int root_rank) = 0;
+        virtual int broadcastDouble(double *buffer, size_t count, int root_rank) = 0;
         virtual int sendChar(char *buffer, size_t count, int dest_rank) = 0;
         virtual int recvChar(char *buffer, size_t count, int src_rank) = 0;
         virtual int reduceSumDouble(double *local_value, double *global_value, int dest_rank) = 0;
