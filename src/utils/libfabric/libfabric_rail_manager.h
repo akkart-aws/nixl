@@ -51,21 +51,26 @@ public:
     /** Create data rails for high-bandwidth transfers (one per EFA device)
      * @param efa_devices List of EFA device names to create rails on
      * @param provider_name Provider name ("efa" or "efa-direct")
+     * @param num_threads Number of threads per rail (for thread pool)
      * @return NIXL_SUCCESS on success, error code on failure
      */
     nixl_status_t
-    createDataRails(const std::vector<std::string> &efa_devices, const std::string &provider_name);
+    createDataRails(const std::vector<std::string> &efa_devices,
+                    const std::string &provider_name,
+                    size_t num_threads = 1);
 
     /** Create control rails for connection management and notifications
      * @param efa_devices List of EFA device names
      * @param provider_name Provider name ("efa" or "efa-direct")
      * @param num_control_rails Number of control rails to create
+     * @param num_threads Number of threads per rail (for thread pool)
      * @return NIXL_SUCCESS on success, error code on failure
      */
     nixl_status_t
     createControlRails(const std::vector<std::string> &efa_devices,
                        const std::string &provider_name,
-                       size_t num_control_rails);
+                       size_t num_control_rails,
+                       size_t num_threads = 1);
 
     // Access rails
     /** Get reference to data rail by ID */

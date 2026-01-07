@@ -48,18 +48,38 @@ nixlLibfabricRailManager::nixlLibfabricRailManager(size_t striping_threshold)
     std::vector<std::string> all_devices = topology->getAllDevices();
     std::string selected_provider_name = topology->getProviderName();
 
-    NIXL_DEBUG << "Got " << all_devices.size()
+
+    std::vector<std::string> selected_devices;
+    for (int i = 0; i < 2; i++) {
+        selected_devices.push_back(all_devices[i]);
+    }
+
+    NIXL_DEBUG << "Got " << selected_devices.size()
                << " network devices from topology for provider=" << selected_provider_name;
 
-    // Create data rails with selected provider - throw on failure
-    nixl_status_t rail_status = createDataRails(all_devices, selected_provider_name);
+    // Get num_threads from environment variable or default to 1
+    size_t num_threads = 1;
+    const char* num_threads_env = getenv("NIXL_LIBFABRIC_NUM_THREADS");
+    if (num_threads_env) {
+        try {
+            num_threads = std::stoull(num_threads_env);
+            NIXL_INFO << "Using NIXL_LIBFABRIC_NUM_THREADS=" << num_threads << " from environment";
+        } catch (const std::exception &e) {
+            NIXL_WARN << "Invalid NIXL_LIBFABRIC_NUM_THREADS value '" << num_threads_env
+                      << "', using default: 1";
+            num_threads = 1;
+        }
+    }
+
+    // Create data rails with selected provider and num_threads - throw on failure
+    nixl_status_t rail_status = createDataRails(selected_devices, selected_provider_name, num_threads);
     if (rail_status != NIXL_SUCCESS) {
         throw std::runtime_error("Failed to create data rails for libfabric rail manager");
     }
 
-    // Create control rails with selected provider - throw on failure
+    // Create control rails with selected provider and num_threads - throw on failure
     nixl_status_t control_rail_status = createControlRails(
-        all_devices, selected_provider_name, NIXL_LIBFABRIC_DEFAULT_CONTROL_RAILS);
+        selected_devices, selected_provider_name, NIXL_LIBFABRIC_DEFAULT_CONTROL_RAILS, num_threads);
     if (control_rail_status != NIXL_SUCCESS) {
         throw std::runtime_error("Failed to create control rails for libfabric rail manager");
     }
@@ -75,7 +95,8 @@ nixlLibfabricRailManager::~nixlLibfabricRailManager() {
 
 nixl_status_t
 nixlLibfabricRailManager::createDataRails(const std::vector<std::string> &efa_devices,
-                                          const std::string &provider_name) {
+                                          const std::string &provider_name,
+                                          size_t num_threads) {
     num_data_rails_ = efa_devices.size();
     // Pre-allocate to ensure contiguous memory allocation
     data_rails_.reserve(num_data_rails_);
@@ -89,7 +110,7 @@ nixlLibfabricRailManager::createDataRails(const std::vector<std::string> &efa_de
 
         for (size_t i = 0; i < num_data_rails_; ++i) {
             data_rails_.emplace_back(std::make_unique<nixlLibfabricRail>(
-                efa_devices[i], provider_name, static_cast<uint16_t>(i)));
+                efa_devices[i], provider_name, static_cast<uint16_t>(i), num_threads));
 
             // Initialize EFA device mapping
             efa_device_to_rail_map[efa_devices[i]] = i;
@@ -108,7 +129,8 @@ nixlLibfabricRailManager::createDataRails(const std::vector<std::string> &efa_de
 nixl_status_t
 nixlLibfabricRailManager::createControlRails(const std::vector<std::string> &efa_devices,
                                              const std::string &provider_name,
-                                             size_t num_control_rails) {
+                                             size_t num_control_rails,
+                                             size_t num_threads) {
     // Pre-allocate to ensure contiguous memory allocation
     num_control_rails_ = num_control_rails;
     control_rails_.reserve(num_control_rails_);
@@ -119,7 +141,7 @@ nixlLibfabricRailManager::createControlRails(const std::vector<std::string> &efa
 
         for (size_t i = 0; i < num_control_rails_; ++i) {
             control_rails_.emplace_back(std::make_unique<nixlLibfabricRail>(
-                efa_devices[i], provider_name, static_cast<uint16_t>(i)));
+                efa_devices[i], provider_name, static_cast<uint16_t>(i), num_threads));
             NIXL_DEBUG << "Created control rail " << i << " (device=" << efa_devices[i]
                        << ", provider=" << provider_name << ")";
         }
@@ -455,9 +477,8 @@ nixlLibfabricRailManager::insertAllAddresses(
                        << " (fi_addr=" << fi_addr << ")";
         }
 
-        ep_names_out.push_back(
-            rails[rail_id]
-                ->ep_name); // This is char[LF_EP_NAME_MAX_LEN], will be converted to char*
+        // Note: ep_names_out is no longer populated as we use thread pool endpoints
+        // The caller should use serializeThreadEndpoints() instead
     }
 
     NIXL_DEBUG << "Successfully processed " << rails.size() << " " << rail_type_str << " rails";
@@ -755,15 +776,15 @@ nixlLibfabricRailManager::serializeRailEndpoints(nixlSerDes &ser_des,
 
     ser_des.addStr(NUM_RAILS_TAG, std::to_string(rails.size()));
 
+    // Serialize all thread endpoints for each rail using the rail's method
     for (size_t rail_id = 0; rail_id < rails.size(); ++rail_id) {
         std::string rail_key = key_prefix + std::to_string(rail_id);
-        const char *ep_name = rails[rail_id]->ep_name;
-        size_t ep_name_len = sizeof(rails[rail_id]->ep_name);
-
-        ser_des.addBuf(rail_key.c_str(), ep_name, ep_name_len);
+        // Use rail's serializeThreadEndpoints method to serialize all thread pool endpoints
+        rails[rail_id]->serializeThreadEndpoints(ser_des, rail_key);
     }
 
-    NIXL_DEBUG << "Serialized " << rails.size() << " " << rail_type_str << " rail endpoints";
+    NIXL_DEBUG << "Serialized " << rails.size() << " " << rail_type_str
+               << " rails with thread pool endpoints";
 }
 
 nixl_status_t
@@ -792,29 +813,40 @@ nixlLibfabricRailManager::deserializeRailEndpoints(
         return NIXL_ERR_BACKEND;
     }
     const size_t num_rails = static_cast<size_t>(num_rails_val);
-    endpoints_out.resize(num_rails);
 
+    // Deserialize thread endpoints for each rail
+    // Each rail may have multiple thread endpoints, so we need to collect all of them
+    endpoints_out.clear();
+    
     for (size_t rail_id = 0; rail_id < num_rails; ++rail_id) {
         std::string rail_key = key_prefix + std::to_string(rail_id);
-
-        // First check if the key exists and get its length
-        ssize_t actual_len = ser_des.getBufLen(rail_key);
-        if (actual_len <= 0) {
-            NIXL_ERROR << "Key " << rail_key << " not found or has invalid length=" << actual_len;
+        
+        // Use the rail's deserializeThreadEndpoints method to handle thread pool format
+        std::vector<std::array<char, LF_EP_NAME_MAX_LEN>> rail_endpoints;
+        
+        // Get the appropriate rail based on the key prefix
+        auto &rails = (key_prefix.find("_data_ep_") != std::string::npos) ? data_rails_ : control_rails_;
+        
+        if (rail_id >= rails.size()) {
+            NIXL_ERROR << "Rail ID " << rail_id << " out of bounds (have " << rails.size() << " rails)";
             return NIXL_ERR_BACKEND;
         }
-
-        if (actual_len > (ssize_t)endpoints_out[rail_id].size()) {
-            NIXL_ERROR << "Buffer too small for rail " << rail_id << ", need " << actual_len
-                       << " bytes, have " << endpoints_out[rail_id].size();
-            return NIXL_ERR_BACKEND;
-        }
-
-        // Get the actual data
-        nixl_status_t status = ser_des.getBuf(rail_key, endpoints_out[rail_id].data(), actual_len);
+        
+        nixl_status_t status = rails[rail_id]->deserializeThreadEndpoints(ser_des, rail_key, rail_endpoints);
         if (status != NIXL_SUCCESS) {
-            NIXL_ERROR << "Failed to get endpoint address for rail " << rail_id
-                       << " with key=" << rail_key << ", status: " << status;
+            NIXL_ERROR << "Failed to deserialize thread endpoints for rail " << rail_id
+                       << " with key=" << rail_key;
+            return NIXL_ERR_BACKEND;
+        }
+        
+        // Add all thread endpoints from this rail to the output
+        // For now, we only use the first thread endpoint for backward compatibility
+        if (!rail_endpoints.empty()) {
+            endpoints_out.push_back(rail_endpoints[0]);
+            NIXL_DEBUG << "Deserialized rail " << rail_id << " with " << rail_endpoints.size()
+                       << " thread endpoints (using first endpoint for compatibility)";
+        } else {
+            NIXL_ERROR << "No thread endpoints found for rail " << rail_id;
             return NIXL_ERR_BACKEND;
         }
     }

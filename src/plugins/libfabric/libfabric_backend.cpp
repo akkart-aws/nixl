@@ -308,22 +308,31 @@ nixlLibfabricEngine::nixlLibfabricEngine(const nixlBackendInitParams *init_param
         }
 
         // Create self-connection
-        std::vector<std::array<char, LF_EP_NAME_MAX_LEN>> data_endpoints(
-            rail_manager.getNumDataRails());
-        std::vector<std::array<char, LF_EP_NAME_MAX_LEN>> control_endpoints(
-            rail_manager.getNumControlRails());
-        // Prepare data rail endpoints
-        for (size_t rail_id = 0; rail_id < rail_manager.getNumDataRails(); ++rail_id) {
-            std::memcpy(data_endpoints[rail_id].data(),
-                        rail_manager.getDataRail(rail_id).ep_name,
-                        sizeof(rail_manager.getDataRail(rail_id).ep_name));
+        // Note: With thread pool design, we serialize ALL thread endpoints for each rail
+        // The serializeConnectionInfo() method will handle this via serializeThreadEndpoints()
+        std::vector<std::array<char, LF_EP_NAME_MAX_LEN>> data_endpoints;
+        std::vector<std::array<char, LF_EP_NAME_MAX_LEN>> control_endpoints;
+        
+        // We no longer copy individual ep_name since rails use thread pools
+        // The connection info will be serialized via rail_manager.serializeConnectionInfo()
+        // which calls serializeThreadEndpoints() for each rail
+        NIXL_DEBUG << "Using thread pool endpoints for " << rail_manager.getNumDataRails()
+                   << " data rails and " << rail_manager.getNumControlRails() << " control rails";
+        // For self-connection, we need to serialize and deserialize our own endpoints
+        // This ensures consistency with remote connections
+        std::string self_conn_info;
+        nixl_status_t serialize_status = rail_manager.serializeConnectionInfo("dest", self_conn_info);
+        if (serialize_status != NIXL_SUCCESS) {
+            throw std::runtime_error("Failed to serialize self-connection info");
         }
-        // Prepare control rail endpoints
-        for (size_t rail_id = 0; rail_id < rail_manager.getNumControlRails(); ++rail_id) {
-            std::memcpy(control_endpoints[rail_id].data(),
-                        rail_manager.getControlRail(rail_id).ep_name,
-                        sizeof(rail_manager.getControlRail(rail_id).ep_name));
+        
+        // Deserialize to get endpoint arrays
+        nixl_status_t deserialize_status = rail_manager.deserializeConnectionInfo(
+            "dest", self_conn_info, data_endpoints, control_endpoints);
+        if (deserialize_status != NIXL_SUCCESS) {
+            throw std::runtime_error("Failed to deserialize self-connection info");
         }
+        
         // Create self-connection using common method
         nixl_status_t conn_status =
             createAgentConnection(localAgent, data_endpoints, control_endpoints);
@@ -1632,21 +1641,27 @@ nixlLibfabricEngine::processConnectionRequest(uint16_t agent_idx,
                << ", initiator_control_fi_addr=" << initiator_control_fi_addr;
 
     // Send acknowledgement back to the initiator using the rail manager
-    size_t ep_name_len = sizeof(rail->ep_name);
+    // Serialize our connection info (all thread endpoints for all rails)
+    std::string ack_conn_info;
+    nixl_status_t serialize_status = rail_manager.serializeConnectionInfo("src", ack_conn_info);
+    if (serialize_status != NIXL_SUCCESS) {
+        NIXL_ERROR << "Failed to serialize connection info for ACK";
+        return serialize_status;
+    }
 
     // Allocate control request
     const size_t control_rail_id = 0;
     nixlLibfabricReq *control_request =
         rail_manager.getControlRail(control_rail_id)
-            .allocateControlRequest(ep_name_len, LibfabricUtils::getNextXferId());
+            .allocateControlRequest(ack_conn_info.length(), LibfabricUtils::getNextXferId());
     if (!control_request) {
         NIXL_ERROR << "Failed to allocate control request for connection ACK";
         return NIXL_ERR_BACKEND;
     }
 
-    // Copy endpoint name to control request buffer
-    std::memcpy(control_request->buffer, rail->ep_name, ep_name_len);
-    control_request->buffer_size = ep_name_len;
+    // Copy serialized connection info to control request buffer
+    std::memcpy(control_request->buffer, ack_conn_info.data(), ack_conn_info.length());
+    control_request->buffer_size = ack_conn_info.length();
 
     nixl_status_t ack_status = rail_manager.postControlMessage(
         nixlLibfabricRailManager::ControlMessageType::CONNECTION_ACK,

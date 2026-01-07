@@ -390,6 +390,7 @@ DataRequestPool* nixlLibfabricRail::getThreadDataPool() const {
     // Thread-local pool ID (separate instance per thread)
     // Each thread gets its own copy of this variable
     thread_local size_t my_pool_id = std::numeric_limits<size_t>::max();
+    thread_local DataRequestPool* my_pool_ptr = nullptr;
     
     // Lazy initialization on first access by this thread
     if (my_pool_id == std::numeric_limits<size_t>::max()) {
@@ -415,35 +416,40 @@ DataRequestPool* nixlLibfabricRail::getThreadDataPool() const {
             return nullptr;
         }
         
+        // Cache the pool pointer in thread-local storage to avoid vector access
+        my_pool_ptr = per_thread_data_pools_[my_pool_id].get();
+        
         NIXL_DEBUG << "Created thread-local data pool " << my_pool_id
                    << " for rail " << rail_id
                    << " (thread=" << std::this_thread::get_id() << ")"
                    << " total_pools=" << per_thread_data_pools_.size();
     }
     
-    // Fast path: Direct return (no lock, ~2 CPU cycles)
-    return per_thread_data_pools_[my_pool_id].get();
+    // Fast path: Return cached pointer (no lock, no vector access, ~1 CPU cycle)
+    return my_pool_ptr;
 }
 
 // Rail Class Implementation
 
+// Thread-local storage for thread ID
+thread_local size_t nixlLibfabricRail::tls_thread_id_ = nixlLibfabricRail::UNASSIGNED;
+
 nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
                                      const std::string &provider,
-                                     uint16_t id)
+                                     uint16_t id,
+                                     size_t num_threads)
     : rail_id(id),
       device_name(device),
       provider_name(provider),
       blocking_cq_sread_supported(true),
+      num_threads_(num_threads),
+      next_thread_id_(0),
       control_request_pool_(NIXL_LIBFABRIC_CONTROL_REQUESTS_PER_RAIL, id),
       provider_supports_hmem_(false) {
-    // Initialize all pointers to nullptr
+    // Initialize shared resource pointers to nullptr
     info = nullptr;
     fabric = nullptr;
     domain = nullptr;
-    endpoint = nullptr;
-    cq = nullptr;
-    av = nullptr;
-    memset(ep_name, 0, sizeof(ep_name));
 
     // Initialize all Libfabric resources for this rail
     NIXL_TRACE << "Initializing rail " << rail_id << " with device=" << device_name
@@ -514,104 +520,105 @@ nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
             throw std::runtime_error("fi_domain failed for rail " + std::to_string(rail_id));
         }
 
-        // Create CQ for this rail
-        struct fi_cq_attr cq_attr = {};
-        cq_attr.format = FI_CQ_FORMAT_DATA;
-        cq_attr.wait_obj = FI_WAIT_UNSPEC;
-        cq_attr.size = 12288;
-        ret = fi_cq_open(domain, &cq_attr, &cq, NULL);
-        if (ret) {
-            NIXL_INFO << "not harmful: fi_cq_open with FI_WAIT_UNSPEC failed for rail " << rail_id
-                      << ": " << fi_strerror(-ret) << " - trying FI_WAIT_NONE for "
-                      << info->fabric_attr->name << " provider";
-            if (ret == -FI_ENOSYS) {
-                NIXL_TRACE << "FI_WAIT_UNSPEC not supported, falling back to FI_WAIT_NONE for rail "
-                           << rail_id;
-                blocking_cq_sread_supported = false;
-                // If fi_cq_open fails due to FI_WAIT_UNSPEC not supported, we fall back to
-                // FI_WAIT_NONE and use fi_cq_read in control rails
-                cq_attr.wait_obj = FI_WAIT_NONE;
-                ret = fi_cq_open(domain, &cq_attr, &cq, NULL);
-                if (ret) {
-                    NIXL_ERROR << "fi_cq_open with FI_WAIT_NONE failed for rail " << rail_id << ": "
-                               << fi_strerror(-ret);
-                    throw std::runtime_error("fi_cq_open with FI_WAIT_NONE failed for rail " +
-                                             std::to_string(rail_id));
-                }
-                NIXL_TRACE << "fi_cq_open with FI_WAIT_NONE succeeded for rail " << rail_id;
-            } else {
-                throw std::runtime_error("fi_cq_open failed for rail " + std::to_string(rail_id));
+        // Create thread pool: num_threads endpoints + CQs + AVs
+        NIXL_INFO << "Creating thread pool with " << num_threads_ << " endpoints for rail " << rail_id;
+        thread_pool_.resize(num_threads_);
+
+        for (size_t thread_idx = 0; thread_idx < num_threads_; ++thread_idx) {
+            ThreadResources& resources = thread_pool_[thread_idx];
+
+            // Create thread-local CQ
+            struct fi_cq_attr thread_cq_attr = {};
+            thread_cq_attr.format = FI_CQ_FORMAT_DATA;
+            thread_cq_attr.wait_obj = FI_WAIT_NONE;  // Non-blocking for thread pools
+            thread_cq_attr.size = 12288;
+            
+            ret = fi_cq_open(domain, &thread_cq_attr, &resources.cq, NULL);
+            if (ret) {
+                NIXL_ERROR << "fi_cq_open failed for thread " << thread_idx << " on rail " << rail_id
+                           << ": " << fi_strerror(-ret);
+                throw std::runtime_error("fi_cq_open failed for thread pool on rail " +
+                                       std::to_string(rail_id));
             }
-        }
-        // Verify CQ was properly created
-        if (!cq) {
-            NIXL_ERROR << "CQ is null after fi_cq_open for rail " << rail_id;
-            throw std::runtime_error("CQ creation returned success but pointer is null for rail " +
-                                     std::to_string(rail_id));
-        }
-        // Create AV for this rail
-        struct fi_av_attr av_attr = {};
-        ret = fi_av_open(domain, &av_attr, &av, NULL);
-        if (ret) {
-            NIXL_ERROR << "fi_av_open failed for rail " << rail_id << ": " << fi_strerror(-ret);
-            throw std::runtime_error("fi_av_open failed for rail " + std::to_string(rail_id));
-        }
 
-        // Create endpoint for this rail
-        ret = fi_endpoint(domain, info, &endpoint, NULL);
-        if (ret) {
-            NIXL_ERROR << "fi_endpoint failed for rail " << rail_id << ": " << fi_strerror(-ret);
-            throw std::runtime_error("fi_endpoint failed for rail " + std::to_string(rail_id));
-        }
+            // Create thread-local AV
+            struct fi_av_attr av_attr = {};
+            ret = fi_av_open(domain, &av_attr, &resources.av, NULL);
+            if (ret) {
+                NIXL_ERROR << "fi_av_open failed for thread " << thread_idx << " on rail " << rail_id
+                           << ": " << fi_strerror(-ret);
+                throw std::runtime_error("fi_av_open failed for thread pool on rail " +
+                                       std::to_string(rail_id));
+            }
 
-        // Bind endpoint with CQ and AV for this rail
-        ret = fi_ep_bind(endpoint, &cq->fid, FI_TRANSMIT | FI_RECV);
-        if (ret) {
-            NIXL_ERROR << "fi_ep_bind cq failed for rail " << rail_id << ": " << fi_strerror(-ret);
-            throw std::runtime_error("fi_ep_bind cq failed for rail " + std::to_string(rail_id));
-        }
+            // Create thread-local endpoint
+            ret = fi_endpoint(domain, info, &resources.endpoint, NULL);
+            if (ret) {
+                NIXL_ERROR << "fi_endpoint failed for thread " << thread_idx << " on rail " << rail_id
+                           << ": " << fi_strerror(-ret);
+                throw std::runtime_error("fi_endpoint failed for thread pool on rail " +
+                                       std::to_string(rail_id));
+            }
 
-        ret = fi_ep_bind(endpoint, &av->fid, 0);
-        if (ret) {
-            NIXL_ERROR << "fi_ep_bind av failed for rail " << rail_id << ": " << fi_strerror(-ret);
-            throw std::runtime_error("fi_ep_bind av failed for rail " + std::to_string(rail_id));
-        }
+            // Bind thread endpoint with thread's OWN CQ and AV
+            ret = fi_ep_bind(resources.endpoint, &resources.cq->fid, FI_TRANSMIT | FI_RECV);
+            if (ret) {
+                NIXL_ERROR << "fi_ep_bind cq failed for thread " << thread_idx << " on rail " << rail_id
+                           << ": " << fi_strerror(-ret);
+                throw std::runtime_error("fi_ep_bind cq failed for thread pool on rail " +
+                                       std::to_string(rail_id));
+            }
+
+            ret = fi_ep_bind(resources.endpoint, &resources.av->fid, 0);  // Bind to thread's OWN AV
+            if (ret) {
+                NIXL_ERROR << "fi_ep_bind av failed for thread " << thread_idx << " on rail " << rail_id
+                           << ": " << fi_strerror(-ret);
+                throw std::runtime_error("fi_ep_bind av failed for thread pool on rail " +
+                                       std::to_string(rail_id));
+            }
 
 #ifdef HAVE_FI_OPT_EFA_USE_UNSOLICITED_WRITE_RECV
-        if (provider_name == "efa") {
-            // Disable unsolicited write recv for EFA RDM to reduce CQ overflow likelihood
-            const bool use_unsolicited_write_recv = false; // Set to false to disable the feature
-            ret = fi_setopt(&endpoint->fid,
-                            FI_OPT_ENDPOINT,
-                            FI_OPT_EFA_USE_UNSOLICITED_WRITE_RECV,
-                            &use_unsolicited_write_recv,
-                            sizeof(use_unsolicited_write_recv));
-            if (ret && ret != -FI_ENOSYS && ret != -FI_ENOPROTOOPT) {
-                NIXL_WARN << "fi_setopt FI_OPT_EFA_USE_UNSOLICITED_WRITE_RECV failed for rail "
-                          << rail_id << ": " << fi_strerror(-ret) << " - continuing anyway";
-            } else if (ret == 0) {
-                NIXL_INFO << "Successfully disabled unsolicited write recv for rail " << rail_id;
-            } else if (ret == -FI_ENOSYS || ret == -FI_ENOPROTOOPT) {
-                NIXL_DEBUG << "FI_OPT_EFA_USE_UNSOLICITED_WRITE_RECV not supported for rail "
-                           << rail_id << " (provider: " << provider_name << ") - skipping";
+            if (provider_name == "efa") {
+                const bool use_unsolicited_write_recv = false;
+                ret = fi_setopt(&resources.endpoint->fid,
+                               FI_OPT_ENDPOINT,
+                               FI_OPT_EFA_USE_UNSOLICITED_WRITE_RECV,
+                               &use_unsolicited_write_recv,
+                               sizeof(use_unsolicited_write_recv));
+                if (ret && ret != -FI_ENOSYS && ret != -FI_ENOPROTOOPT) {
+                    NIXL_WARN << "fi_setopt failed for thread " << thread_idx << " on rail " << rail_id
+                              << ": " << fi_strerror(-ret);
+                }
             }
-        }
 #endif
 
-        // Enable endpoint for this rail
-        ret = fi_enable(endpoint);
-        if (ret) {
-            NIXL_ERROR << "fi_enable failed for rail " << rail_id << ": " << fi_strerror(-ret);
-            throw std::runtime_error("fi_enable failed for rail " + std::to_string(rail_id));
+            // Enable thread endpoint
+            ret = fi_enable(resources.endpoint);
+            if (ret) {
+                NIXL_ERROR << "fi_enable failed for thread " << thread_idx << " on rail " << rail_id
+                           << ": " << fi_strerror(-ret);
+                throw std::runtime_error("fi_enable failed for thread pool on rail " +
+                                       std::to_string(rail_id));
+            }
+
+            // Get thread endpoint name
+            size_t thread_ep_name_len = sizeof(resources.ep_name);
+            ret = fi_getname(&resources.endpoint->fid, resources.ep_name, &thread_ep_name_len);
+            if (ret) {
+                NIXL_ERROR << "fi_getname failed for thread " << thread_idx << " on rail " << rail_id
+                           << ": " << fi_strerror(-ret);
+                throw std::runtime_error("fi_getname failed for thread pool on rail " +
+                                       std::to_string(rail_id));
+            }
+
+            NIXL_DEBUG << "Created thread resources " << thread_idx << " for rail " << rail_id
+                       << " (endpoint=" << resources.endpoint
+                       << ", cq=" << resources.cq
+                       << ", av=" << resources.av << ")";
         }
 
-        // Get endpoint name for this rail
-        size_t ep_name_len = sizeof(ep_name);
-        ret = fi_getname(&endpoint->fid, ep_name, &ep_name_len);
-        if (ret) {
-            NIXL_ERROR << "fi_getname failed for rail " << rail_id << ": " << fi_strerror(-ret);
-            throw std::runtime_error("fi_getname failed for rail " + std::to_string(rail_id));
-        }
+        NIXL_INFO << "Successfully created thread pool with " << num_threads_ << " endpoints for rail "
+                  << rail_id;
 
         // Initialize control request pool with buffers
         nixl_status_t status = control_request_pool_.initialize(domain);
@@ -663,44 +670,63 @@ nixlLibfabricRail::~nixlLibfabricRail() {
 
 bool
 nixlLibfabricRail::isProperlyInitialized() const {
-    return (cq != nullptr && endpoint != nullptr && domain != nullptr);
+    // Check thread pool initialization instead of legacy resources
+    return (domain != nullptr && !thread_pool_.empty() &&
+            thread_pool_[0].endpoint != nullptr &&
+            thread_pool_[0].cq != nullptr &&
+            thread_pool_[0].av != nullptr);
 }
 
 void
 nixlLibfabricRail::cleanup() {
     NIXL_TRACE << "Starting cleanup for rail " << rail_id;
 
-    // STEP 1: Close endpoint first to stop any new operations
-    if (endpoint) {
-        NIXL_TRACE << "Closing endpoint for rail " << rail_id;
-        int ret = fi_close(&endpoint->fid);
-        if (ret) {
-            NIXL_WARN << "fi_close endpoint failed for rail " << rail_id << ": "
-                      << fi_strerror(-ret);
+    // STEP 1: Close all thread pool endpoints first
+    NIXL_DEBUG << "Closing " << thread_pool_.size() << " thread pool endpoints for rail " << rail_id;
+    for (size_t i = 0; i < thread_pool_.size(); ++i) {
+        if (thread_pool_[i].endpoint) {
+            NIXL_TRACE << "Closing thread endpoint " << i << " for rail " << rail_id;
+            int ret = fi_close(&thread_pool_[i].endpoint->fid);
+            if (ret) {
+                NIXL_WARN << "fi_close thread endpoint " << i << " failed for rail " << rail_id
+                          << ": " << fi_strerror(-ret);
+            }
+            thread_pool_[i].endpoint = nullptr;
         }
-        endpoint = nullptr;
     }
 
-    // STEP 2: Close CQ after endpoint
-    if (cq) {
-        NIXL_TRACE << "Closing completion queue for rail " << rail_id;
-        int ret = fi_close(&cq->fid);
-        if (ret) {
-            NIXL_WARN << "fi_close cq failed for rail " << rail_id << ": " << fi_strerror(-ret);
+    // STEP 2: Close all thread pool CQs
+    NIXL_DEBUG << "Closing " << thread_pool_.size() << " thread pool CQs for rail " << rail_id;
+    for (size_t i = 0; i < thread_pool_.size(); ++i) {
+        if (thread_pool_[i].cq) {
+            NIXL_TRACE << "Closing thread CQ " << i << " for rail " << rail_id;
+            int ret = fi_close(&thread_pool_[i].cq->fid);
+            if (ret) {
+                NIXL_WARN << "fi_close thread cq " << i << " failed for rail " << rail_id
+                          << ": " << fi_strerror(-ret);
+            }
+            thread_pool_[i].cq = nullptr;
         }
-        cq = nullptr;
     }
 
-    if (av) {
-        NIXL_TRACE << "Closing address vector for rail " << rail_id;
-        int ret = fi_close(&av->fid);
-        if (ret) {
-            NIXL_WARN << "fi_close av failed for rail " << rail_id << ": " << fi_strerror(-ret);
+    // STEP 3: Close all thread pool AVs (CRITICAL!)
+    NIXL_DEBUG << "Closing " << thread_pool_.size() << " thread pool AVs for rail " << rail_id;
+    for (size_t i = 0; i < thread_pool_.size(); ++i) {
+        if (thread_pool_[i].av) {
+            NIXL_TRACE << "Closing thread AV " << i << " for rail " << rail_id;
+            int ret = fi_close(&thread_pool_[i].av->fid);
+            if (ret) {
+                NIXL_WARN << "fi_close thread av " << i << " failed for rail " << rail_id
+                          << ": " << fi_strerror(-ret);
+            }
+            thread_pool_[i].av = nullptr;
         }
-        av = nullptr;
     }
 
-    // STEP 3: Clean up request pools while domain is still valid
+    // Clear thread pool
+    thread_pool_.clear();
+
+    // STEP 4: Clean up request pools while domain is still valid
     // This ensures all memory registrations (MRs) are properly deregistered before domain closure
     NIXL_TRACE << "Cleaning up request pools for rail " << rail_id;
     control_request_pool_.cleanup();
@@ -713,7 +739,7 @@ nixlLibfabricRail::cleanup() {
         per_thread_data_pools_.clear();  // Calls destructors automatically
     }
     
-    // STEP 4: Close domain AFTER all MRs, endpoint, CQ, AV are closed
+    // STEP 5: Close domain AFTER all MRs, endpoints, CQs, AVs are closed
     if (domain) {
         NIXL_TRACE << "Closing domain for rail " << rail_id;
         int ret = fi_close(&domain->fid);
@@ -722,7 +748,7 @@ nixlLibfabricRail::cleanup() {
         }
         domain = nullptr;
     }
-    // STEP 5: Close fabric
+    // STEP 6: Close fabric
     if (fabric) {
         NIXL_TRACE << "Closing fabric for rail " << rail_id;
         int ret = fi_close(&fabric->fid);
@@ -731,7 +757,7 @@ nixlLibfabricRail::cleanup() {
         }
         fabric = nullptr;
     }
-    // STEP 6: Free info structure
+    // STEP 7: Free info structure
     if (info) {
         NIXL_INFO << "Freeing info structure for rail " << rail_id;
         fi_freeinfo(info);
@@ -762,40 +788,65 @@ nixlLibfabricRail::setXferIdCallback(std::function<void(uint32_t)> callback) {
     xferIdCallback = callback;
 }
 
+// Thread Pool Helper Methods
+
+size_t
+nixlLibfabricRail::getThreadId() const {
+    // Check if this thread already has an ID assigned
+    if (tls_thread_id_ == UNASSIGNED) {
+        // Assign next available thread ID using round-robin
+        tls_thread_id_ = next_thread_id_.fetch_add(1) % num_threads_;
+        
+        NIXL_DEBUG << "Assigned thread ID " << tls_thread_id_ << " to thread "
+                   << std::this_thread::get_id() << " on rail " << rail_id;
+    }
+    
+    return tls_thread_id_;
+}
+
+ThreadResources*
+nixlLibfabricRail::getThreadResources() const {
+    size_t thread_id = getThreadId();
+    
+    // Bounds check
+    if (thread_id >= thread_pool_.size()) {
+        NIXL_ERROR << "Thread ID " << thread_id << " out of bounds (pool size: "
+                   << thread_pool_.size() << ") on rail " << rail_id;
+        return nullptr;
+    }
+    
+    return const_cast<ThreadResources*>(&thread_pool_[thread_id]);
+}
+
 // Per-Rail Completion Processing
 
 // Per-rail completion processing - handles one rail's CQ with configurable blocking behavior
+// CRITICAL: Checks ALL thread endpoints on this rail, not just the calling thread's CQ
 nixl_status_t
 nixlLibfabricRail::progressCompletionQueue(bool use_blocking) const {
-    // Completion processing
-    struct fi_cq_data_entry completion;
-    memset(&completion, 0, sizeof(completion));
-
-    int ret;
-
-    // Only protect libfabric CQ hardware operations
-    {
-        std::lock_guard<std::mutex> cq_lock(cq_progress_mutex_);
-
-        if (use_blocking && blocking_cq_sread_supported) {
-            // Blocking read using fi_cq_sread (used by CM thread)
-            ret = fi_cq_sread(cq, &completion, 1, nullptr, NIXL_LIBFABRIC_CQ_SREAD_TIMEOUT_MS);
-        } else {
-            // Non-blocking read (used by progress thread or fallback)
-            ret = fi_cq_read(cq, &completion, 1);
-        }
-
+    bool any_completions = false;
+    
+    // Check ALL thread endpoints on this rail (multi-endpoint progress loop)
+    for (size_t thread_idx = 0; thread_idx < num_threads_; ++thread_idx) {
+        const ThreadResources& resources = thread_pool_[thread_idx];
+        
+        // Completion processing for this thread's CQ
+        struct fi_cq_data_entry completion;
+        memset(&completion, 0, sizeof(completion));
+        
+        int ret = fi_cq_read(resources.cq, &completion, 1);
+        
         if (ret < 0 && ret != -FI_EAGAIN) {
-            NIXL_ERROR << "fi_cq_read returned error " << ret << " on rail " << rail_id << ": "
-                       << fi_strerror(-ret);
-
-            // Handle error - but be careful about fi_cq_readerr
+            NIXL_ERROR << "fi_cq_read returned error " << ret << " on rail " << rail_id
+                       << " thread " << thread_idx << ": " << fi_strerror(-ret);
+            
+            // Handle error - read from this thread's CQ
             struct fi_cq_err_entry err_entry;
             memset(&err_entry, 0, sizeof(err_entry));
-
-            int err_ret = fi_cq_readerr(cq, &err_entry, 0);
+            
+            int err_ret = fi_cq_readerr(resources.cq, &err_entry, 0);
             if (err_ret > 0) {
-                NIXL_ERROR << "CQ read failed on rail " << rail_id
+                NIXL_ERROR << "CQ read failed on rail " << rail_id << " thread " << thread_idx
                            << " with error: " << fi_strerror(err_entry.err)
                            << " prov_errno: " << err_entry.prov_errno << " len: " << err_entry.len;
             } else {
@@ -803,30 +854,40 @@ nixlLibfabricRail::progressCompletionQueue(bool use_blocking) const {
             }
             return NIXL_ERR_BACKEND;
         }
-    }
-    // CQ lock released here - completion is now local data
-
-    if (ret == -FI_EAGAIN) {
-        return NIXL_IN_PROG; // No completions available
-    }
-
-    if (ret == 1) {
-        NIXL_TRACE << "Completion received on rail " << rail_id << " flags=" << std::hex
-                   << completion.flags << " data=" << completion.data
-                   << " context=" << completion.op_context << std::dec;
-
-        // Process completion using local data. Callbacks have their own thread safety
-        nixl_status_t status = processCompletionQueueEntry(&completion);
-        if (status != NIXL_SUCCESS) {
-            NIXL_ERROR << "Failed to process completion on rail " << rail_id;
-            return status;
+        
+        if (ret == -FI_EAGAIN) {
+            // No completions on this thread's CQ, continue to next thread
+            continue;
         }
-
-        NIXL_DEBUG << "Completion processed on rail " << rail_id;
+        
+        if (ret == 1) {
+            NIXL_TRACE << "Completion received on rail " << rail_id << " thread " << thread_idx
+                       << " flags=" << std::hex << completion.flags << " data=" << completion.data
+                       << " context=" << completion.op_context << std::dec;
+            
+            // Process completion using local data. Callbacks have their own thread safety
+            nixl_status_t status = processCompletionQueueEntry(&completion);
+            if (status != NIXL_SUCCESS) {
+                NIXL_ERROR << "Failed to process completion on rail " << rail_id
+                           << " thread " << thread_idx;
+                return status;
+            }
+            
+            NIXL_TRACE << "Completion processed on rail " << rail_id << " thread " << thread_idx;
+            any_completions = true;
+            
+            // Continue checking other threads even after finding a completion
+            // This ensures we process all available completions across all threads
+        }
+    }
+    
+    if (any_completions) {
+        NIXL_DEBUG << "Processed completions on rail " << rail_id;
         return NIXL_SUCCESS;
     }
-
-    return NIXL_ERR_BACKEND; // Unexpected case
+    
+    // No completions on any thread
+    return NIXL_IN_PROG;
 }
 
 // Route completion to appropriate handler (rail-specific)
@@ -1094,10 +1155,18 @@ nixlLibfabricRail::postRecv(nixlLibfabricReq *req) const {
     msg.context = &req->ctx; // Use request's context directly
     msg.data = 0;
 
-    NIXL_TRACE << "Posting receive on endpoint=" << endpoint << " buffer=" << req->buffer
+    // Get thread-local resources
+    ThreadResources* resources = getThreadResources();
+    if (!resources) {
+        NIXL_ERROR << "Failed to get thread resources on rail " << rail_id;
+        return NIXL_ERR_BACKEND;
+    }
+
+    NIXL_TRACE << "Posting receive on thread endpoint=" << resources->endpoint << " buffer=" << req->buffer
                << " size=" << req->buffer_size << " context=" << &req->ctx;
 
-    int ret = fi_recvmsg(endpoint, &msg, 0);
+    // Use thread-local endpoint
+    int ret = fi_recvmsg(resources->endpoint, &msg, 0);
     if (ret) {
         NIXL_ERROR << "fi_recvmsg failed on rail " << rail_id << ": " << fi_strerror(-ret);
         return NIXL_ERR_BACKEND;
@@ -1118,7 +1187,14 @@ nixlLibfabricRail::postSend(nixlLibfabricReq *req) const {
     // Prepare descriptor
     void *desc = fi_mr_desc(req->mr);
 
-    NIXL_TRACE << "Sending data on endpoint=" << endpoint << " buffer=" << req->buffer
+    // Get thread-local resources
+    ThreadResources* resources = getThreadResources();
+    if (!resources) {
+        NIXL_ERROR << "Failed to get thread resources on rail " << rail_id;
+        return NIXL_ERR_BACKEND;
+    }
+
+    NIXL_TRACE << "Sending data on thread endpoint=" << resources->endpoint << " buffer=" << req->buffer
                << " size=" << req->buffer_size << " immediate_data=" << std::hex
                << req->immediate_data
                << " msg_type=" << NIXL_GET_MSG_TYPE_FROM_IMM(req->immediate_data)
@@ -1131,17 +1207,13 @@ nixlLibfabricRail::postSend(nixlLibfabricReq *req) const {
     int attempt = 0;
 
     while (true) {
-        // Protect fi_senddata call with endpoint submission mutex
-        {
-            std::lock_guard<std::mutex> submit_lock(ep_submission_mutex_);
-            ret = fi_senddata(endpoint,
-                              req->buffer,
-                              req->buffer_size,
-                              desc,
-                              req->immediate_data,
-                              req->dest_addr,
-                              &req->ctx);
-        }
+        ret = fi_senddata(resources->endpoint,
+                          req->buffer,
+                          req->buffer_size,
+                          desc,
+                          req->immediate_data,
+                          req->dest_addr,
+                          &req->ctx);
 
         if (ret == 0) {
             // Success
@@ -1197,7 +1269,7 @@ nixlLibfabricRail::postWrite(nixlLibfabricReq *req) const {
     // Get local descriptor from the request's MR
     void *local_desc = fi_mr_desc(req->local_mr);
 
-    NIXL_TRACE << "Posting RDMA write on endpoint=" << endpoint
+    NIXL_TRACE << "Posting RDMA write"
                << " local_buffer=" << req->local_addr << " length=" << req->chunk_size
                << " immediate_data=" << req->immediate_data << " dest_addr=" << req->dest_addr
                << " remote_addr=" << (void *)req->remote_addr << " remote_key=" << req->remote_key
@@ -1207,21 +1279,22 @@ nixlLibfabricRail::postWrite(nixlLibfabricReq *req) const {
     int ret = -FI_EAGAIN;
     int attempt = 0;
 
+    ThreadResources* resources = getThreadResources();
+    if (!resources) {
+        NIXL_ERROR << "Failed to get thread resources on rail " << rail_id;
+        return NIXL_ERR_BACKEND;
+    }
+
     while (true) {
-        // Protect fi_writedata call with endpoint submission mutex
-        // Even with FI_THREAD_SAFE, concurrent submissions can cause corruption
-        {
-            std::lock_guard<std::mutex> submit_lock(ep_submission_mutex_);
-            ret = fi_writedata(endpoint,
-                               req->local_addr,
-                               req->chunk_size,
-                               local_desc,
-                               req->immediate_data,
-                               req->dest_addr,
-                               req->remote_addr,
-                               req->remote_key,
-                               &req->ctx);
-        }
+        ret = fi_writedata(resources->endpoint,
+                           req->local_addr,
+                           req->chunk_size,
+                           local_desc,
+                           req->immediate_data,
+                           req->dest_addr,
+                           req->remote_addr,
+                           req->remote_key,
+                           &req->ctx);
 
         if (ret == 0) {
             // Success
@@ -1277,7 +1350,7 @@ nixlLibfabricRail::postRead(nixlLibfabricReq *req) const {
     // Get local descriptor from the request's MR
     void *local_desc = fi_mr_desc(req->local_mr);
 
-    NIXL_TRACE << "Posting RDMA read on endpoint=" << std::hex << endpoint
+    NIXL_TRACE << "Posting RDMA read"
                << " local_buffer=" << req->local_addr << " length=" << req->chunk_size
                << " dest_addr=" << req->dest_addr << " remote_addr=" << (void *)req->remote_addr
                << " remote_key=" << req->remote_key << " context=" << &req->ctx;
@@ -1285,20 +1358,21 @@ nixlLibfabricRail::postRead(nixlLibfabricReq *req) const {
     // Retry indefinitely until readdata succeeds or fails for all providers
     int ret = -FI_EAGAIN;
     int attempt = 0;
+    ThreadResources* resources = getThreadResources();
+    if (!resources) {
+        NIXL_ERROR << "Failed to get thread resources on rail " << rail_id;
+        return NIXL_ERR_BACKEND;
+    }
 
     while (true) {
-        // Protect fi_read call with endpoint submission mutex
-        {
-            std::lock_guard<std::mutex> submit_lock(ep_submission_mutex_);
-            ret = fi_read(endpoint,
-                          req->local_addr,
-                          req->chunk_size,
-                          local_desc,
-                          req->dest_addr,
-                          req->remote_addr,
-                          req->remote_key,
-                          &req->ctx);
-        }
+        ret = fi_read(resources->endpoint,
+                      req->local_addr,
+                      req->chunk_size,
+                      local_desc,
+                      req->dest_addr,
+                      req->remote_addr,
+                      req->remote_key,
+                      &req->ctx);
 
         if (ret == 0) {
             // Success
@@ -1464,12 +1538,15 @@ nixlLibfabricRail::insertAddress(const void *addr, fi_addr_t *fi_addr_out) const
         NIXL_ERROR << "Invalid parameters on rail " << rail_id;
         return NIXL_ERR_INVALID_PARAM;
     }
-    if (!av) {
-        NIXL_ERROR << "Address vector not initialized on rail " << rail_id;
+    
+    // Get thread-local resources
+    ThreadResources* resources = getThreadResources();
+    if (!resources || !resources->av) {
+        NIXL_ERROR << "Address vector not initialized for thread on rail " << rail_id;
         return NIXL_ERR_BACKEND;
     }
 
-    int ret = fi_av_insert(av, addr, 1, fi_addr_out, 0, NULL);
+    int ret = fi_av_insert(resources->av, addr, 1, fi_addr_out, 0, NULL);
     if (ret != 1) {
         NIXL_ERROR << "fi_av_insert failed on rail " << rail_id << ": " << fi_strerror(-ret);
         return NIXL_ERR_BACKEND;
@@ -1484,12 +1561,15 @@ nixlLibfabricRail::removeAddress(fi_addr_t fi_addr) const {
         NIXL_ERROR << "Invalid fi_addr parameter on rail " << rail_id;
         return NIXL_ERR_INVALID_PARAM;
     }
-    if (!av) {
-        NIXL_ERROR << "Address vector not initialized on rail " << rail_id;
+    
+    // Get thread-local resources
+    ThreadResources* resources = getThreadResources();
+    if (!resources || !resources->av) {
+        NIXL_ERROR << "Address vector not initialized for thread on rail " << rail_id;
         return NIXL_ERR_BACKEND;
     }
 
-    int ret = fi_av_remove(av, &fi_addr, 1, 0);
+    int ret = fi_av_remove(resources->av, &fi_addr, 1, 0);
     if (ret != 0) {
         NIXL_ERROR << "fi_av_remove failed on rail " << rail_id << ": " << fi_strerror(-ret);
         return NIXL_ERR_BACKEND;
@@ -1594,4 +1674,84 @@ nixlLibfabricRail::findRequestFromContext(void *context) const {
 fi_info *
 nixlLibfabricRail::getRailInfo() const {
     return info;
+}
+
+// Connection Serialization Methods
+
+void
+nixlLibfabricRail::serializeThreadEndpoints(nixlSerDes &ser_des, const std::string &key_prefix) const {
+    // Serialize number of threads
+    ser_des.addStr(key_prefix + "_num_threads", std::to_string(num_threads_));
+    
+    // Serialize each thread's endpoint address
+    for (size_t thread_idx = 0; thread_idx < num_threads_; ++thread_idx) {
+        std::string thread_key = key_prefix + "_thread_" + std::to_string(thread_idx);
+        const char* ep_name = thread_pool_[thread_idx].ep_name;
+        size_t ep_name_len = sizeof(thread_pool_[thread_idx].ep_name);
+        
+        ser_des.addBuf(thread_key.c_str(), ep_name, ep_name_len);
+        
+        NIXL_TRACE << "Serialized thread " << thread_idx << " endpoint for rail " << rail_id
+                   << " with key " << thread_key;
+    }
+    
+    NIXL_DEBUG << "Serialized " << num_threads_ << " thread endpoints for rail " << rail_id;
+}
+
+nixl_status_t
+nixlLibfabricRail::deserializeThreadEndpoints(
+    nixlSerDes &ser_des,
+    const std::string &key_prefix,
+    std::vector<std::array<char, LF_EP_NAME_MAX_LEN>> &endpoints_out) const {
+    
+    // Deserialize number of threads
+    std::string num_threads_str;
+    try {
+        num_threads_str = ser_des.getStr(key_prefix + "_num_threads");
+    } catch (const std::exception &e) {
+        NIXL_ERROR << "Failed to get num_threads for key " << key_prefix << ": " << e.what();
+        return NIXL_ERR_BACKEND;
+    }
+    
+    size_t remote_num_threads;
+    try {
+        remote_num_threads = std::stoull(num_threads_str);
+    } catch (const std::exception &e) {
+        NIXL_ERROR << "Invalid num_threads value: " << num_threads_str;
+        return NIXL_ERR_BACKEND;
+    }
+    
+    // Resize output vector
+    endpoints_out.resize(remote_num_threads);
+    
+    // Deserialize each thread's endpoint address
+    for (size_t thread_idx = 0; thread_idx < remote_num_threads; ++thread_idx) {
+        std::string thread_key = key_prefix + "_thread_" + std::to_string(thread_idx);
+        
+        // Check buffer length
+        ssize_t actual_len = ser_des.getBufLen(thread_key);
+        if (actual_len <= 0) {
+            NIXL_ERROR << "Key " << thread_key << " not found or has invalid length=" << actual_len;
+            return NIXL_ERR_BACKEND;
+        }
+        
+        if (actual_len > (ssize_t)endpoints_out[thread_idx].size()) {
+            NIXL_ERROR << "Buffer too small for thread " << thread_idx << ", need " << actual_len
+                       << " bytes, have " << endpoints_out[thread_idx].size();
+            return NIXL_ERR_BACKEND;
+        }
+        
+        // Get the actual data
+        nixl_status_t status = ser_des.getBuf(thread_key, endpoints_out[thread_idx].data(), actual_len);
+        if (status != NIXL_SUCCESS) {
+            NIXL_ERROR << "Failed to get endpoint address for thread " << thread_idx
+                       << " with key=" << thread_key << ", status: " << status;
+            return NIXL_ERR_BACKEND;
+        }
+        
+        NIXL_TRACE << "Deserialized thread " << thread_idx << " endpoint for rail " << rail_id;
+    }
+    
+    NIXL_DEBUG << "Deserialized " << remote_num_threads << " thread endpoints for rail " << rail_id;
+    return NIXL_SUCCESS;
 }

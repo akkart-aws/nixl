@@ -25,6 +25,8 @@
 #include <mutex>
 #include <ostream>
 #include <stack>
+#include <atomic>
+#include <limits>
 
 #include "nixl.h"
 #include "backend/backend_aux.h"
@@ -248,17 +250,24 @@ operator<<(std::ostream &os, const ConnectionState &state) {
     }
 }
 
-/** Individual libfabric rail managing fabric, domain, endpoint, CQ, and AV */
+/** Thread-local resources for lock-free operation */
+struct ThreadResources {
+    struct fid_ep* endpoint;           ///< Thread-local endpoint
+    struct fid_cq* cq;                 ///< Thread-local completion queue
+    struct fid_av* av;                 ///< Thread-local address vector
+    char ep_name[LF_EP_NAME_MAX_LEN]; ///< Thread-local endpoint name
+};
+
+/** Individual libfabric rail managing fabric, domain, and thread pool resources */
 class nixlLibfabricRail {
 public:
     uint16_t rail_id; ///< Unique rail identifier
     std::string device_name; ///< EFA device name for this rail
     std::string provider_name; ///< Provider name (e.g., "efa", "efa-direct")
-    char ep_name[LF_EP_NAME_MAX_LEN]; ///< Endpoint name for connection setup
     mutable bool blocking_cq_sread_supported; ///< Whether blocking CQ reads are supported
 
-    /** Initialize libfabric rail with all resources */
-    nixlLibfabricRail(const std::string &device, const std::string &provider, uint16_t id);
+    /** Initialize libfabric rail with all resources and thread pool */
+    nixlLibfabricRail(const std::string &device, const std::string &provider, uint16_t id, size_t num_threads = 1);
 
     /** Destroy rail and cleanup all libfabric resources */
     ~nixlLibfabricRail();
@@ -371,21 +380,34 @@ public:
     fi_info *
     getRailInfo() const;
 
-private:
-    // Core libfabric resources
-    struct fi_info *info; // from rail_infos[rail_id]
-    struct fid_fabric *fabric; // from rail_fabrics[rail_id]
-    struct fid_domain *domain; // from rail_domains[rail_id]
-    struct fid_cq *cq; // from rail_cqs[rail_id]
-    struct fid_av *av; // from rail_avs[rail_id]
-    struct fid_ep *endpoint; ///< Libfabric endpoint handle
+    /** Serialize all thread endpoint addresses for connection establishment */
+    void
+    serializeThreadEndpoints(nixlSerDes &ser_des, const std::string &key_prefix) const;
 
-    // CQ progress mutex to protect completion queue operations
-    mutable std::mutex cq_progress_mutex_;
-    
-    // Endpoint submission mutex to protect fi_writedata/fi_senddata/fi_read calls
-    // Even with FI_THREAD_SAFE, concurrent submissions can cause corruption
-    mutable std::mutex ep_submission_mutex_;
+    /** Deserialize thread endpoint addresses from remote peer */
+    nixl_status_t
+    deserializeThreadEndpoints(nixlSerDes &ser_des,
+                               const std::string &key_prefix,
+                               std::vector<std::array<char, LF_EP_NAME_MAX_LEN>> &endpoints_out) const;
+
+private:
+    // Core libfabric resources (shared across threads)
+    struct fi_info *info;
+    struct fid_fabric *fabric;
+    struct fid_domain *domain;
+
+    // Thread pool infrastructure for lock-free operation
+    size_t num_threads_;                              ///< Number of threads in pool
+    std::vector<ThreadResources> thread_pool_;        ///< Fixed pool of thread resources
+    static thread_local size_t tls_thread_id_;        ///< Thread-local ID (UNASSIGNED until first use)
+    mutable std::atomic<size_t> next_thread_id_;      ///< Atomic counter for thread ID assignment
+    static constexpr size_t UNASSIGNED = std::numeric_limits<size_t>::max();
+
+    /** Get thread ID for current thread (lazy TLS initialization) */
+    size_t getThreadId() const;
+
+    /** Get thread-local resources for current thread */
+    ThreadResources* getThreadResources() const;
 
     // Callback functions
     std::function<void(const std::string &)> notificationCallback;
