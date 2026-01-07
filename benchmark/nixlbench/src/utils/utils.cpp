@@ -1056,6 +1056,8 @@ xferBenchUtils::printStats(bool is_target,
     // called here
     if (is_target && IS_PAIRWISE_AND_SG() && rt->getSize() > 2) {
         rt->reduceSumDouble(&throughput_gb, &totalbw, 0);
+        // Target ranks must participate in broadcast barrier before returning
+        rt->broadcastDouble(&totalbw, 1, 0);
         return;
     }
 
@@ -1072,14 +1074,16 @@ xferBenchUtils::printStats(bool is_target,
                      (total_duration / 1e6)); // In GB/Sec
 
     if (IS_PAIRWISE_AND_SG() && rt->getSize() > 2) {
+        // Perform reduction to rank 0
         rt->reduceSumDouble(&throughput_gb, &totalbw, 0);
+        
+        // ALL ranks (initiators AND targets) must participate in broadcast barrier
+        rt->broadcastDouble(&totalbw, 1, 0);
     } else {
         totalbw = throughput_gb;
     }
 
-    if (IS_PAIRWISE_AND_SG() && rt->getRank() != 0) {
-        return;
-    }
+    // All initiator ranks will print their individual BW and aggregated BW
 
     double prepare_duration = stats.prepare_duration.avg();
     double prepare_p99_duration = stats.prepare_duration.p99();

@@ -86,6 +86,7 @@ public:
     int sendInt(int *buffer, int dest_rank) override;
     int recvInt(int *buffer, int src_rank) override;
     int broadcastInt(int *buffer, size_t count, int root_rank) override;
+    int broadcastDouble(double *buffer, size_t count, int root_rank) override;
     int sendChar(char *buffer, size_t count, int dest_rank) override;
     int recvChar(char *buffer, size_t count, int src_rank) override;
 
