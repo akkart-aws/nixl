@@ -498,3 +498,71 @@ int xferBenchEtcdRT::broadcastInt(int* buffer, size_t count, int root_rank) {
         return -1;
     }
 }
+
+int xferBenchEtcdRT::broadcastDouble(double* buffer, size_t count, int root_rank) {
+    try {
+        // Create a unique key for this broadcast operation
+        std::string bcast_key  = makeKey("bcast/double", root_rank);
+        std::string barrier_id = "bcast_double_" + std::to_string(root_rank);
+
+        // First phase: root process puts the value in etcd
+        if (my_rank == root_rank) {
+            // Serialize array of doubles using binary representation
+            std::string value_str(reinterpret_cast<char *>(buffer), count * sizeof(double));
+            client->put(bcast_key, value_str);
+        }
+
+        // Synchronize to ensure the value is written before non-root processes try to read it
+        barrier(barrier_id + "_write");
+
+        // Second phase: non-root processes read the value
+        if (my_rank != root_rank) {
+            int retries = 0;
+            bool data_received = false;
+
+            while (!data_received && should_retry(retries, 10)) {
+                auto response = client->get(bcast_key);
+                if (response.error_code() == 0) {
+                    std::string value_str = response.value().as_string();
+                    try {
+                        // Deserialize binary data directly into the buffer
+                        if (value_str.size() >= count * sizeof(double)) {
+                            std::memcpy(buffer, value_str.data(), count * sizeof(double));
+                            data_received = true;
+                        } else {
+                            std::cerr << "Received data size (" << value_str.size()
+                                      << ") is smaller than expected (" << count * sizeof(double) << ")" << std::endl;
+                            retries++;
+                        }
+                    }
+                    catch (const std::exception &e) {
+                        std::cerr << "Error deserializing broadcast data: " << e.what() << std::endl;
+                        return -1;
+                    }
+                } else {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    retries++;
+                }
+            }
+
+            if (!data_received) {
+                std::cerr << "Failed to read broadcast data from rank "
+                          << root_rank << std::endl;
+                return -1;
+            }
+        }
+
+        // Synchronize to ensure all processes have read the value before cleaning up
+        barrier(barrier_id + "_read");
+
+        // Clean up
+        if (my_rank == root_rank) {
+            client->rm(bcast_key);
+        }
+
+        return 0;
+    } catch (const std::exception& e) {
+        std::cerr << "Error in broadcast operation: " << e.what() << std::endl;
+        return -1;
+    }
+}

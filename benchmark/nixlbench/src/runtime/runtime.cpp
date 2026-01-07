@@ -38,6 +38,10 @@ int xferBenchRT::broadcastInt(int *buffer, size_t count, int root_rank) {
     return 0;
 }
 
+int xferBenchRT::broadcastDouble(double *buffer, size_t count, int root_rank) {
+    return 0;
+}
+
 int xferBenchRT::sendChar(char *buffer, size_t count, int dest_rank) {
     return 0;
 }
