@@ -253,9 +253,10 @@ public:
     std::string provider_name; ///< Provider name (e.g., "efa", "efa-direct")
     char ep_name[LF_EP_NAME_MAX_LEN]; ///< Endpoint name for connection setup
     mutable bool blocking_cq_sread_supported; ///< Whether blocking CQ reads are supported
+    bool progress_thread_enabled_; ///< Whether progress thread is enabled (to skip retry CQ polling)
 
     /** Initialize libfabric rail with all resources */
-    nixlLibfabricRail(const std::string &device, const std::string &provider, uint16_t id);
+    nixlLibfabricRail(const std::string &device, const std::string &provider, uint16_t id, bool progress_thread_enabled = false);
 
     /** Destroy rail and cleanup all libfabric resources */
     ~nixlLibfabricRail();
@@ -364,6 +365,10 @@ public:
     /** Find request from libfabric context pointer */
     nixlLibfabricReq *
     findRequestFromContext(void *context) const;
+
+    /** Set progress thread enabled flag */
+    void
+    setProgressThreadEnabled(bool enabled);
 
     fi_info *
     getRailInfo() const;

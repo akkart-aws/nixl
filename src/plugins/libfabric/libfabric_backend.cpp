@@ -243,9 +243,10 @@ nixlLibfabricEngine::nixlLibfabricEngine(const nixlBackendInitParams *init_param
       cm_thread_stop_(false),
       progress_thread_enabled_(init_params->enableProgTh),
       progress_thread_delay_(std::chrono::microseconds(init_params->pthrDelay)),
-      rail_manager(NIXL_LIBFABRIC_DEFAULT_STRIPING_THRESHOLD) {
+      rail_manager(NIXL_LIBFABRIC_DEFAULT_STRIPING_THRESHOLD, init_params->enableProgTh) {
 
     NIXL_DEBUG << "Initializing Libfabric Backend with GPU Support";
+    progress_thread_delay_ = std::chrono::microseconds(10);
 
 #ifdef HAVE_CUDA
     // Initialize CUDA context management
