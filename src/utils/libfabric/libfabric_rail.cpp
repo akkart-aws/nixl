@@ -384,11 +384,13 @@ DataRequestPool::allocate(nixlLibfabricReq::OpType op_type, uint32_t req_id) {
 
 nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
                                      const std::string &provider,
-                                     uint16_t id)
+                                     uint16_t id,
+                                     bool progress_thread_enabled)
     : rail_id(id),
       device_name(device),
       provider_name(provider),
       blocking_cq_sread_supported(true),
+      progress_thread_enabled_(progress_thread_enabled),
       control_request_pool_(NIXL_LIBFABRIC_CONTROL_REQUESTS_PER_RAIL, id),
       data_request_pool_(NIXL_LIBFABRIC_DATA_REQUESTS_PER_RAIL, id),
       provider_supports_hmem_(false) {
@@ -1136,9 +1138,12 @@ nixlLibfabricRail::postSend(nixlLibfabricReq *req) const {
                                     NIXL_LIBFABRIC_MAX_RETRY_DELAY_US);
 
             // Progress completion queue to drain pending completions before retry
-            nixl_status_t progress_status = progressCompletionQueue(false);
-            if (progress_status == NIXL_SUCCESS) {
-                NIXL_TRACE << "Progressed completions on rail " << rail_id << " before retry";
+            // Skip if progress thread is enabled to avoid lock contention
+            if (!progress_thread_enabled_) {
+                nixl_status_t progress_status = progressCompletionQueue(false);
+                if (progress_status == NIXL_SUCCESS) {
+                    NIXL_TRACE << "Progressed completions on rail " << rail_id << " before retry";
+                }
             }
 
             usleep(delay_us);
@@ -1216,9 +1221,12 @@ nixlLibfabricRail::postWrite(nixlLibfabricReq *req) const {
                                     NIXL_LIBFABRIC_MAX_RETRY_DELAY_US);
 
             // Progress completion queue to drain pending completions before retry
-            nixl_status_t progress_status = progressCompletionQueue(false);
-            if (progress_status == NIXL_SUCCESS) {
-                NIXL_TRACE << "Progressed completions on rail " << rail_id << " before retry";
+            // Skip if progress thread is enabled to avoid lock contention
+            if (!progress_thread_enabled_) {
+                nixl_status_t progress_status = progressCompletionQueue(false);
+                if (progress_status == NIXL_SUCCESS) {
+                    NIXL_TRACE << "Progressed completions on rail " << rail_id << " before retry";
+                }
             }
 
             usleep(delay_us);
@@ -1293,9 +1301,12 @@ nixlLibfabricRail::postRead(nixlLibfabricReq *req) const {
                                     NIXL_LIBFABRIC_MAX_RETRY_DELAY_US);
 
             // Progress completion queue to drain pending completions before retry
-            nixl_status_t progress_status = progressCompletionQueue(false);
-            if (progress_status == NIXL_SUCCESS) {
-                NIXL_TRACE << "Progressed completions on rail " << rail_id << " before retry";
+            // Skip if progress thread is enabled to avoid lock contention
+            if (!progress_thread_enabled_) {
+                nixl_status_t progress_status = progressCompletionQueue(false);
+                if (progress_status == NIXL_SUCCESS) {
+                    NIXL_TRACE << "Progressed completions on rail " << rail_id << " before retry";
+                }
             }
 
             usleep(delay_us);
@@ -1531,6 +1542,11 @@ nixlLibfabricRail::findRequestFromContext(void *context) const {
     }
     NIXL_ERROR << "No request found for context " << context << " on rail " << rail_id;
     return nullptr;
+}
+
+void
+nixlLibfabricRail::setProgressThreadEnabled(bool enabled) {
+    progress_thread_enabled_ = enabled;
 }
 
 fi_info *
