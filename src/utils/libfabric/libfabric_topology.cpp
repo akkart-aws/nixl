@@ -91,6 +91,12 @@ nixlLibfabricTopology::discoverTopology() {
             NIXL_ERROR << "Failed to build GPU to EFA mapping";
             return status;
         }
+        // Build GPU to NUMA mapping for NUMA-aware resource allocation
+        status = buildGpuToNumaMapping();
+        if (status != NIXL_SUCCESS) {
+            NIXL_WARN << "Failed to build GPU to NUMA mapping, continuing without NUMA awareness";
+            // Non-fatal - continue without NUMA mapping
+        }
     } else {
         // For TCP/sockets devices, bypass complex topology discovery
         NIXL_INFO << "Using simplified topology for " << provider_name
@@ -748,4 +754,81 @@ nixlLibfabricTopology::groupNicsWithGpus(const std::vector<NicInfo> &discovered_
         }
     }
     return NIXL_SUCCESS;
+}
+
+nixl_status_t
+nixlLibfabricTopology::buildGpuToNumaMapping() {
+    gpu_to_numa_map.clear();
+    
+    // Hardcoded mapping for P6 instances (AWS p6b.48xlarge with H200 GPUs)
+    // GPU 0-3 are on NUMA node 0
+    // GPU 4-7 are on NUMA node 1
+    // This mapping is based on the physical topology of P6 instances
+    
+    for (int gpu_id = 0; gpu_id <= 3; gpu_id++) {
+        gpu_to_numa_map[gpu_id] = 0;
+    }
+    for (int gpu_id = 4; gpu_id <= 7; gpu_id++) {
+        gpu_to_numa_map[gpu_id] = 1;
+    }
+    
+    NIXL_INFO << "Built GPU-to-NUMA mapping for P6 instance topology:";
+    NIXL_INFO << "  GPUs 0-3 → NUMA node 0";
+    NIXL_INFO << "  GPUs 4-7 → NUMA node 1";
+    
+    return NIXL_SUCCESS;
+}
+
+int
+nixlLibfabricTopology::getNumaNodeForGpu(int gpu_id) const {
+    auto it = gpu_to_numa_map.find(gpu_id);
+    if (it != gpu_to_numa_map.end()) {
+        return it->second;
+    }
+    
+    // Fallback: if GPU ID not in map, return NUMA node 0
+    NIXL_WARN << "GPU " << gpu_id << " not found in NUMA mapping, defaulting to NUMA node 0";
+    return 0;
+}
+
+int
+nixlLibfabricTopology::getGpuIdForEfaDevice(const std::string &efa_device) const {
+    // Search through the pci_to_efa_devices map to find which GPU this EFA device belongs to
+    // The map is: PCI bus ID -> vector of EFA devices
+    // We need to find which PCI entry contains this EFA device
+    
+    for (const auto &pair : pci_to_efa_devices) {
+        const std::vector<std::string> &efa_devices = pair.second;
+        auto it = std::find(efa_devices.begin(), efa_devices.end(), efa_device);
+        if (it != efa_devices.end()) {
+            // Found the EFA device, now extract GPU ID from PCI bus ID
+            // PCI format is like "0:59:00.0" for GPU 0, "0:b1:00.0" for GPU 4, etc.
+            // For P6 instances, we can use a simple heuristic based on bus ID
+            const std::string &pci_bus_id = pair.first;
+            
+            // Parse the bus ID to determine GPU
+            unsigned int domain, bus, device, function;
+            if (sscanf(pci_bus_id.c_str(), "%x:%x:%x.%x", &domain, &bus, &device, &function) == 4) {
+                // For P6 instances, GPU IDs correlate with bus IDs
+                // This is a heuristic - in production you'd want a more robust mapping
+                // For now, use the index in the map as a proxy for GPU ID
+                // since the topology discovery orders them consistently
+                
+                // Count which index this PCI is in the map
+                int gpu_index = 0;
+                for (const auto &check_pair : pci_to_efa_devices) {
+                    if (check_pair.first == pci_bus_id) {
+                        NIXL_DEBUG << "EFA device " << efa_device << " belongs to GPU " << gpu_index
+                                   << " (PCI: " << pci_bus_id << ")";
+                        return gpu_index;
+                    }
+                    gpu_index++;
+                }
+            }
+        }
+    }
+    
+    // If not found in mapping, return -1 to indicate no specific GPU affinity
+    NIXL_DEBUG << "EFA device " << efa_device << " not found in GPU mapping, returning -1";
+    return -1;
 }

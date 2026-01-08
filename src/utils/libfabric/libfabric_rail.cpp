@@ -25,6 +25,13 @@
 #include <stdexcept>
 #include <stack>
 
+#ifdef __linux__
+#include <numa.h>
+#include <numaif.h>
+#include <pthread.h>
+#include <sched.h>
+#endif
+
 // RequestPool Base Class Implementation
 
 RequestPool::RequestPool(size_t pool_size, size_t rail_id)
@@ -385,7 +392,8 @@ DataRequestPool::allocate(nixlLibfabricReq::OpType op_type, uint32_t req_id) {
 nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
                                      const std::string &provider,
                                      uint16_t id,
-                                     bool progress_thread_enabled)
+                                     bool progress_thread_enabled,
+                                     int numa_node)
     : rail_id(id),
       device_name(device),
       provider_name(provider),
@@ -402,6 +410,49 @@ nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
     cq = nullptr;
     av = nullptr;
     memset(ep_name, 0, sizeof(ep_name));
+
+    // Bind to NUMA node if specified (before allocating any resources)
+    if (numa_node >= 0) {
+#ifdef __linux__
+        if (numa_available() >= 0) {
+            // Set memory allocation policy to this NUMA node
+            struct bitmask *nodemask = numa_allocate_nodemask();
+            numa_bitmask_clearall(nodemask);
+            numa_bitmask_setbit(nodemask, numa_node);
+            numa_bind(nodemask);
+            numa_free_nodemask(nodemask);
+            
+            // CRITICAL FIX FOR RNR: Pin CPU affinity to this NUMA node
+            // This ensures the thread calling fi_cq_read() runs on CPUs from the correct NUMA node
+            // Without this, the thread can run on any CPU, causing slow cross-NUMA memory access
+            // to the completion queue, which fills the receiver's queue and triggers RNR errors
+            numa_run_on_node(numa_node);
+            
+            // Get the current thread's CPU affinity to verify and report
+            cpu_set_t cpuset;
+            CPU_ZERO(&cpuset);
+            if (pthread_getaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset) == 0) {
+                int cpu_count = CPU_COUNT(&cpuset);
+                NIXL_WARN << "*** NUMA BINDING *** Rail " << rail_id << " (device=" << device_name
+                          << ") bound to NUMA node " << numa_node
+                          << " - memory allocation AND CPU affinity set (CPUs available: " << cpu_count << ")";
+            } else {
+                NIXL_WARN << "*** NUMA BINDING *** Rail " << rail_id << " (device=" << device_name
+                          << ") bound to NUMA node " << numa_node
+                          << " - memory allocation AND CPU affinity set";
+            }
+        } else {
+            NIXL_WARN << "NUMA not available on this system, skipping NUMA binding for rail "
+                      << rail_id << " (device=" << device_name << ")";
+        }
+#else
+        NIXL_WARN << "NUMA binding not supported on non-Linux systems, skipping for rail "
+                  << rail_id << " (device=" << device_name << ")";
+#endif
+    } else {
+        NIXL_WARN << "Rail " << rail_id << " (device=" << device_name
+                  << ") has no NUMA affinity - resources will be allocated on default NUMA node";
+    }
 
     // Initialize all Libfabric resources for this rail
     NIXL_TRACE << "Initializing rail " << rail_id << " with device=" << device_name

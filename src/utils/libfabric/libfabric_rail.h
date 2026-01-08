@@ -256,7 +256,7 @@ public:
     bool progress_thread_enabled_; ///< Whether progress thread is enabled (to skip retry CQ polling)
 
     /** Initialize libfabric rail with all resources */
-    nixlLibfabricRail(const std::string &device, const std::string &provider, uint16_t id, bool progress_thread_enabled = false);
+    nixlLibfabricRail(const std::string &device, const std::string &provider, uint16_t id, bool progress_thread_enabled = false, int numa_node = -1);
 
     /** Destroy rail and cleanup all libfabric resources */
     ~nixlLibfabricRail();

@@ -34,12 +34,23 @@ libfabric_utils_headers = files(
 # Find hwloc dependency
 hwloc_dep = dependency('hwloc', required: true)
 
+# Find libnuma dependency (optional, for NUMA-aware resource allocation)
+numa_dep = dependency('numa', required: false)
+
 # Set up dependencies and compile args
 libfabric_utils_deps = [
     libfabric_dep,
     hwloc_dep,
     abseil_proj.get_variable('absl_log_dep'),
 ]
+
+# Add libnuma if available
+if numa_dep.found()
+    libfabric_utils_deps += [numa_dep]
+    message('libnuma found - NUMA-aware resource allocation enabled')
+else
+    message('libnuma not found - NUMA-aware resource allocation disabled')
+endif
 
 libfabric_utils_cpp_args = []
 

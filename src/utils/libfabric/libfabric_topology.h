@@ -35,6 +35,9 @@ private:
     // PCI bus ID to EFA device mapping: "0000:72:00.0"→[efa0,efa1], etc.
     std::unordered_map<std::string, std::vector<std::string>> pci_to_efa_devices;
 
+    // GPU ID to NUMA node mapping for NUMA-aware resource allocation
+    std::unordered_map<int, int> gpu_to_numa_map;
+
     // All available network devices discovered on this system
     std::vector<std::string> all_devices;
 
@@ -75,6 +78,8 @@ private:
     discoverEfaDevicesWithHwloc();
     nixl_status_t
     buildGpuToEfaMapping();
+    nixl_status_t
+    buildGpuToNumaMapping();
     void
     cleanupHwlocTopology();
 
@@ -128,6 +133,14 @@ public:
     // GPU-based queries (main interface)
     std::vector<std::string>
     getEfaDevicesForGPUPci(const std::string &pci_bus_id) const;
+
+    // Get NUMA node for a specific GPU ID
+    int
+    getNumaNodeForGpu(int gpu_id) const;
+    
+    // Get GPU ID for a given EFA device (returns -1 if not found)
+    int
+    getGpuIdForEfaDevice(const std::string &efa_device) const;
 
     // System information
     int

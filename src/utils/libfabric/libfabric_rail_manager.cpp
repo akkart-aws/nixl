@@ -91,15 +91,28 @@ nixlLibfabricRailManager::createDataRails(const std::vector<std::string> &efa_de
         data_rails_.reserve(num_data_rails_);
 
         for (size_t i = 0; i < num_data_rails_; ++i) {
+            // Get GPU ID for this EFA device to determine NUMA node
+            int gpu_id = topology->getGpuIdForEfaDevice(efa_devices[i]);
+            int numa_node = -1;
+            
+            if (gpu_id >= 0) {
+                numa_node = topology->getNumaNodeForGpu(gpu_id);
+                NIXL_WARN << "*** DATA RAIL " << i << " *** EFA device " << efa_devices[i]
+                          << " → GPU " << gpu_id << " → NUMA node " << numa_node;
+            } else {
+                NIXL_WARN << "*** DATA RAIL " << i << " *** EFA device " << efa_devices[i]
+                          << " has no GPU affinity - will use default NUMA node";
+            }
+            
             data_rails_.emplace_back(std::make_unique<nixlLibfabricRail>(
-                efa_devices[i], provider_name, static_cast<uint16_t>(i), progress_thread_enabled_));
+                efa_devices[i], provider_name, static_cast<uint16_t>(i), progress_thread_enabled_, numa_node));
 
             // Initialize EFA device mapping
             efa_device_to_rail_map[efa_devices[i]] = i;
 
             NIXL_DEBUG << "Created data rail " << i << " (device=" << efa_devices[i]
                        << ", provider=" << provider_name << ", progress_thread_enabled="
-                       << progress_thread_enabled_ << ")";
+                       << progress_thread_enabled_ << ", numa_node=" << numa_node << ")";
         }
     }
     catch (const std::exception &e) {
@@ -122,11 +135,24 @@ nixlLibfabricRailManager::createControlRails(const std::vector<std::string> &efa
         control_rails_.reserve(num_control_rails_);
 
         for (size_t i = 0; i < num_control_rails_; ++i) {
+            // Get GPU ID for this EFA device to determine NUMA node
+            int gpu_id = topology->getGpuIdForEfaDevice(efa_devices[i]);
+            int numa_node = -1;
+            
+            if (gpu_id >= 0) {
+                numa_node = topology->getNumaNodeForGpu(gpu_id);
+                NIXL_WARN << "*** CONTROL RAIL " << i << " *** EFA device " << efa_devices[i]
+                          << " → GPU " << gpu_id << " → NUMA node " << numa_node;
+            } else {
+                NIXL_WARN << "*** CONTROL RAIL " << i << " *** EFA device " << efa_devices[i]
+                          << " has no GPU affinity - will use default NUMA node";
+            }
+            
             control_rails_.emplace_back(std::make_unique<nixlLibfabricRail>(
-                efa_devices[i], provider_name, static_cast<uint16_t>(i), progress_thread_enabled_));
+                efa_devices[i], provider_name, static_cast<uint16_t>(i), progress_thread_enabled_, numa_node));
             NIXL_DEBUG << "Created control rail " << i << " (device=" << efa_devices[i]
                        << ", provider=" << provider_name << ", progress_thread_enabled="
-                       << progress_thread_enabled_ << ")";
+                       << progress_thread_enabled_ << ", numa_node=" << numa_node << ")";
         }
     }
     catch (const std::exception &e) {
