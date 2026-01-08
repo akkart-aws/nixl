@@ -132,8 +132,9 @@ public:
 /** Request handle for multi-rail transfer operations */
 class nixlLibfabricBackendH : public nixlBackendReqH {
 private:
-    std::atomic<size_t> completed_requests_; // Atomic count of completed requests
-    std::atomic<size_t> submitted_requests_; // Total number of submitted requests
+    // Cache-aligned atomics to prevent false sharing between threads
+    alignas(64) std::atomic<size_t> completed_requests_; // Atomic count of completed requests
+    alignas(64) std::atomic<size_t> submitted_requests_; // Total number of submitted requests
 
 public:
     uint16_t post_xfer_id;

@@ -37,11 +37,13 @@ resetSeqId();
 static std::atomic<size_t> round_robin_counter{0};
 static const std::string NUM_RAILS_TAG{"num_rails"};
 
-nixlLibfabricRailManager::nixlLibfabricRailManager(size_t striping_threshold)
+nixlLibfabricRailManager::nixlLibfabricRailManager(size_t striping_threshold,
+                                                   bool progress_thread_enabled)
     : striping_threshold_(striping_threshold),
+      progress_thread_enabled_(progress_thread_enabled),
       runtime_(FI_HMEM_CUDA) {
     NIXL_DEBUG << "Creating rail manager with striping threshold: " << striping_threshold_
-               << " bytes";
+               << " bytes, progress_thread_enabled: " << progress_thread_enabled_;
 
     // Initialize topology system
     topology = std::make_unique<nixlLibfabricTopology>();
@@ -106,13 +108,14 @@ nixlLibfabricRailManager::createDataRails(const std::vector<std::string> &efa_de
 
         for (size_t i = 0; i < num_data_rails_; ++i) {
             data_rails_.emplace_back(std::make_unique<nixlLibfabricRail>(
-                efa_devices[i], provider_name, static_cast<uint16_t>(i)));
+                efa_devices[i], provider_name, static_cast<uint16_t>(i), progress_thread_enabled_));
 
             // Initialize EFA device mapping
             efa_device_to_rail_map[efa_devices[i]] = i;
 
             NIXL_DEBUG << "Created data rail " << i << " (device=" << efa_devices[i]
-                       << ", provider=" << provider_name << ")";
+                       << ", provider=" << provider_name
+                       << ", progress_thread_enabled=" << progress_thread_enabled_ << ")";
         }
     }
     catch (const std::exception &e) {
@@ -136,9 +139,10 @@ nixlLibfabricRailManager::createControlRails(const std::vector<std::string> &efa
 
         for (size_t i = 0; i < num_control_rails_; ++i) {
             control_rails_.emplace_back(std::make_unique<nixlLibfabricRail>(
-                efa_devices[i], provider_name, static_cast<uint16_t>(i)));
+                efa_devices[i], provider_name, static_cast<uint16_t>(i), progress_thread_enabled_));
             NIXL_DEBUG << "Created control rail " << i << " (device=" << efa_devices[i]
-                       << ", provider=" << provider_name << ")";
+                       << ", provider=" << provider_name
+                       << ", progress_thread_enabled=" << progress_thread_enabled_ << ")";
         }
     }
     catch (const std::exception &e) {
