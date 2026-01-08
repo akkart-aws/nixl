@@ -292,7 +292,7 @@ nixlLibfabricEngine::nixlLibfabricEngine(const nixlBackendInitParams *init_param
       cm_thread_stop_(false),
       progress_thread_enabled_(init_params->enableProgTh),
       progress_thread_delay_(std::chrono::microseconds(init_params->pthrDelay)),
-      rail_manager(NIXL_LIBFABRIC_DEFAULT_STRIPING_THRESHOLD),
+      rail_manager(NIXL_LIBFABRIC_DEFAULT_STRIPING_THRESHOLD, init_params->enableProgTh),
       runtime_(FI_HMEM_SYSTEM) {
 
     NIXL_DEBUG << "Initializing Libfabric Backend";
@@ -1508,7 +1508,7 @@ nixlLibfabricEngine::cmThread() {
         }
         // Sleep briefly to avoid spinning too aggressively when blocking cq read is not used
         if (!rail_manager.getControlRail(0).blocking_cq_sread_supported) {
-            std::this_thread::sleep_for(std::chrono::nanoseconds(10));
+            std::this_thread::yield();
         }
     }
     NIXL_DEBUG << "CM: Thread exiting cleanly";

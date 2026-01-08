@@ -41,9 +41,10 @@ public:
     /** Initialize rail manager with topology discovery and create rails based on available
      * network devices
      * @param striping_threshold Size threshold for enabling multi-rail striping
+     * @param progress_thread_enabled Whether progress threads are enabled
      * @throws std::runtime_error if initialization fails
      */
-    nixlLibfabricRailManager(size_t striping_threshold);
+    nixlLibfabricRailManager(size_t striping_threshold, bool progress_thread_enabled = false);
     /** Destroy rail manager and cleanup all resources */
     ~nixlLibfabricRailManager();
 
@@ -313,6 +314,7 @@ public:
 
 private:
     size_t striping_threshold_;
+    bool progress_thread_enabled_;
 
     // System runtime type (determined once at initialization)
     fi_hmem_iface runtime_;
