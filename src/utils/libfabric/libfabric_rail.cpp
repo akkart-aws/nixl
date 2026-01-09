@@ -779,68 +779,115 @@ nixlLibfabricRail::setXferIdCallback(std::function<void(uint32_t)> callback) {
 // Per-Rail Completion Processing
 
 // Per-rail completion processing - handles one rail's CQ with configurable blocking behavior
+// Optimized to drain multiple completions per call to prevent RNR errors
 nixl_status_t
 nixlLibfabricRail::progressCompletionQueue(bool use_blocking) const {
-    // Completion processing
-    struct fi_cq_data_entry completion;
-    memset(&completion, 0, sizeof(completion));
+    // Batch completion processing - read multiple completions per call
+    // Based on NCCL-OFI pattern for efficient CQ draining
+    const int CQ_READ_COUNT = 4;  // Read up to 4 completions per fi_cq_read call
+    const int MAX_COMPLETIONS_PER_PROGRESS = 64;  // Maximum total completions to process
+    struct fi_cq_data_entry completions[MAX_COMPLETIONS_PER_PROGRESS];
+    memset(completions, 0, sizeof(completions));
 
     int ret;
+    int total_completed = 0;
 
-    // Only protect libfabric CQ hardware operations
+    // Try to acquire CQ lock WITHOUT blocking - if another thread is progressing, just return
+    // This prevents convoy effects where multiple threads pile up waiting for the same CQ
     {
-        std::lock_guard<std::mutex> cq_lock(cq_progress_mutex_);
-
+        std::unique_lock<std::mutex> cq_lock(cq_progress_mutex_, std::try_to_lock);
+        
+        if (!cq_lock.owns_lock()) {
+            // Another thread is already progressing this CQ - return immediately
+            NIXL_TRACE << "CQ busy on rail " << rail_id << " - returning IN_PROG";
+            return NIXL_IN_PROG;
+        }
+        
         if (use_blocking && blocking_cq_sread_supported) {
             // Blocking read using fi_cq_sread (used by CM thread)
-            ret = fi_cq_sread(cq, &completion, 1, nullptr, NIXL_LIBFABRIC_CQ_SREAD_TIMEOUT_MS);
-        } else {
-            // Non-blocking read (used by progress thread or fallback)
-            ret = fi_cq_read(cq, &completion, 1);
-        }
-
-        if (ret < 0 && ret != -FI_EAGAIN) {
-            NIXL_ERROR << "fi_cq_read returned error " << ret << " on rail " << rail_id << ": "
-                       << fi_strerror(-ret);
-
-            // Handle error - but be careful about fi_cq_readerr
-            struct fi_cq_err_entry err_entry;
-            memset(&err_entry, 0, sizeof(err_entry));
-
-            int err_ret = fi_cq_readerr(cq, &err_entry, 0);
-            if (err_ret > 0) {
-                NIXL_ERROR << "CQ read failed on rail " << rail_id
-                           << " with error: " << fi_strerror(err_entry.err)
-                           << " prov_errno: " << err_entry.prov_errno << " len: " << err_entry.len;
-            } else {
-                NIXL_ERROR << "fi_cq_readerr failed with " << err_ret;
+            // For blocking mode, only read one completion and return
+            ret = fi_cq_sread(cq, &completions[0], 1, nullptr, NIXL_LIBFABRIC_CQ_SREAD_TIMEOUT_MS);
+            
+            if (ret == -FI_EAGAIN) {
+                return NIXL_IN_PROG; // No completions available
             }
-            return NIXL_ERR_BACKEND;
+            
+            if (ret == 1) {
+                total_completed = 1;
+            }
+        } else {
+            // Non-blocking read - drain multiple completions aggressively
+            // Read completions in batches while holding the lock
+            while (total_completed < MAX_COMPLETIONS_PER_PROGRESS) {
+                // Read up to CQ_READ_COUNT completions in a single call
+                int remaining = MAX_COMPLETIONS_PER_PROGRESS - total_completed;
+                int read_count = (remaining < CQ_READ_COUNT) ? remaining : CQ_READ_COUNT;
+                
+                ret = fi_cq_read(cq, &completions[total_completed], read_count);
+                
+                if (ret > 0) {
+                    // Successfully read 'ret' number of completions
+                    total_completed += ret;
+                    NIXL_TRACE << "Read " << ret << " completions on rail " << rail_id
+                               << " (total: " << total_completed << ")";
+                } else if (ret == -FI_EAGAIN) {
+                    // No more completions available
+                    break;
+                } else if (ret == -FI_EAVAIL) {
+                    // Error available - handle it
+                    struct fi_cq_err_entry err_entry;
+                    memset(&err_entry, 0, sizeof(err_entry));
+                    
+                    int err_ret = fi_cq_readerr(cq, &err_entry, 0);
+                    if (err_ret > 0) {
+                        NIXL_ERROR << "CQ read failed on rail " << rail_id
+                                   << " with error: " << fi_strerror(err_entry.err)
+                                   << " prov_errno: " << err_entry.prov_errno
+                                   << " len: " << err_entry.len;
+                    } else if (err_ret == -FI_EAGAIN) {
+                        // Error not available yet, will retry later
+                        NIXL_WARN << "fi_cq_readerr returned EAGAIN on rail " << rail_id;
+                    } else {
+                        NIXL_ERROR << "fi_cq_readerr failed with " << err_ret << " on rail " << rail_id;
+                    }
+                    return NIXL_ERR_BACKEND;
+                } else {
+                    // Other error
+                    NIXL_ERROR << "fi_cq_read returned error " << ret << " on rail " << rail_id
+                               << ": " << fi_strerror(-ret);
+                    return NIXL_ERR_BACKEND;
+                }
+            }
         }
     }
-    // CQ lock released here - completion is now local data
+    // CQ lock released here - NOW process completions outside the lock
 
-    if (ret == -FI_EAGAIN) {
+    if (total_completed == 0) {
         return NIXL_IN_PROG; // No completions available
     }
 
-    if (ret == 1) {
-        NIXL_TRACE << "Completion received on rail " << rail_id << " flags=" << std::hex
-                   << completion.flags << " data=" << completion.data
-                   << " context=" << completion.op_context << std::dec;
+    // Process all completions OUTSIDE the lock to avoid deadlock
+    // This allows completion callbacks to call progressCompletionQueue() recursively
+    for (int i = 0; i < total_completed; i++) {
+        NIXL_TRACE << "Processing completion " << i << " on rail " << rail_id
+                   << " flags=" << std::hex << completions[i].flags
+                   << " data=" << completions[i].data
+                   << " context=" << completions[i].op_context << std::dec;
 
-        // Process completion using local data. Callbacks have their own thread safety
-        nixl_status_t status = processCompletionQueueEntry(&completion);
+        nixl_status_t status = processCompletionQueueEntry(&completions[i]);
         if (status != NIXL_SUCCESS) {
-            NIXL_ERROR << "Failed to process completion on rail " << rail_id;
+            NIXL_ERROR << "Failed to process completion " << i << " on rail " << rail_id;
             return status;
         }
-
-        NIXL_DEBUG << "Completion processed on rail " << rail_id;
-        return NIXL_SUCCESS;
     }
 
-    return NIXL_ERR_BACKEND; // Unexpected case
+    if (total_completed == 1) {
+        NIXL_DEBUG << "Processed 1 completion on rail " << rail_id;
+    } else {
+        NIXL_DEBUG << "Processed " << total_completed << " completions on rail " << rail_id;
+    }
+    
+    return NIXL_SUCCESS;
 }
 
 // Route completion to appropriate handler (rail-specific)
