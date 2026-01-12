@@ -35,6 +35,21 @@
 #include <utils/serdes/serdes.h>
 #include <omp.h>
 
+#ifdef __linux__
+#include <numa.h>
+#include <numaif.h>
+#include <pthread.h>
+#include <sched.h>
+#include <unistd.h>
+
+// Function to check which CPU the process is currently running on
+int getCurrentCPU() {
+    return sched_getcpu();
+}
+
+// Add this periodically in your code to monitor
+#endif
+
 #define ROUND_UP(value, granularity) \
     ((((value) + (granularity) - 1) / (granularity)) * (granularity))
 
@@ -105,6 +120,78 @@ xferBenchNixlWorker::xferBenchNixlWorker(int *argc, char ***argv, std::vector<st
     std::vector<nixl_backend_t> plugins;
 
     rank = rt->getRank();
+
+    // NUMA-aware binding: Bind process to NUMA node based on GPU assignment
+    // Determine GPU ID from rank
+    int gpu_id = rank;
+    if (isTarget()) {
+        gpu_id -= xferBenchConfig::num_initiator_dev;
+    }
+    
+    // Map GPU to NUMA node (P6 instance topology: GPUs 0-3 → NUMA 0, GPUs 4-7 → NUMA 1)
+int numa_node = -1;
+if (gpu_id >= 0 && gpu_id <= 3) {
+    numa_node = 0;
+} else if (gpu_id >= 4 && gpu_id <= 7) {
+    numa_node = 1;
+}
+
+// Bind to NUMA node if valid GPU ID
+if (numa_node >= 0) {
+#ifdef __linux__
+    if (numa_available() >= 0) {
+        // Set memory allocation policy to this NUMA node
+        struct bitmask *nodemask = numa_allocate_nodemask();
+        numa_bitmask_clearall(nodemask);
+        numa_bitmask_setbit(nodemask, numa_node);
+        numa_bind(nodemask);
+        numa_free_nodemask(nodemask);
+
+        // Pin CPU affinity to specific cores:
+        // Calculate core based on rank/GPU ID
+        int core_id = -1;
+        if (numa_node == 0) {
+            // Cores for NUMA node 0 - use rank as offset within node
+            core_id = gpu_id * 4;  // Each GPU gets 4 dedicated cores, adjust as needed
+        } else if (numa_node == 1) {
+            // Cores for NUMA node 1 - adjust for offset
+            core_id = (gpu_id - 4) * 4 + 32;  // Assuming NUMA node 1 cores start at 32
+        }
+
+        // Pin to a single specific core
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        CPU_SET(core_id, &cpuset);
+        if (sched_setaffinity(0, sizeof(cpuset), &cpuset) == 0) {
+            std::cout << "*** CPU PINNING *** Rank " << rank << " (GPU " << gpu_id 
+                     << ") strictly pinned to CPU core " << core_id << std::endl;
+
+            // Verify core after pinning
+            int current_core = getCurrentCPU();
+            std::cout << "Process is currently running on CPU core: " << current_core << std::endl;
+
+            // Get and report affinity mask (for debugging)
+            pthread_getaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+            int cpu_count = CPU_COUNT(&cpuset);
+            std::cout << "*** NUMA BINDING *** Rank " << rank << " (GPU " << gpu_id
+                      << ") bound to NUMA node " << numa_node
+                      << " - memory allocation AND CPU affinity set (CPUs available: " << cpu_count << ")" << std::endl;
+        } else {
+            std::cerr << "*** CPU PINNING FAILED *** Rank " << rank << " (GPU " << gpu_id
+                     << ") - ERROR: " << strerror(errno) << std::endl;
+        }
+    } else {
+        std::cout << "NUMA not available on this system, skipping NUMA binding for rank "
+                  << rank << " (GPU " << gpu_id << ")" << std::endl;
+    }
+#else
+    std::cout << "NUMA binding not supported on non-Linux systems, skipping for rank "
+              << rank << " (GPU " << gpu_id << ")" << std::endl;
+#endif
+} else {
+    std::cout << "Rank " << rank << " (GPU " << gpu_id
+              << ") has no NUMA affinity - resources will be allocated on default NUMA node" << std::endl;
+}
 
     nixlAgentConfig dev_meta(enable_pt, false, 0, sync_mode);
 
@@ -1350,3 +1437,4 @@ xferBenchNixlWorker::synchronizeStart() {
     }
     return -1;
 }
+
