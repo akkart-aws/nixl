@@ -106,6 +106,9 @@ endif
 # OpenMP
 openmp_dep = dependency('openmp', required: true)
 
+# Find libnuma dependency (optional, for NUMA-aware resource allocation)
+numa_dep = dependency('numa', required: false)
+
 # Check for etcd-cpp-api - use multiple methods for discovery
 etcd_dep = dependency('etcd-cpp-api', required : false)
 
@@ -121,6 +124,13 @@ if etcd_available
     add_project_arguments('-DHAVE_ETCD', language: 'cpp')
 else
     message('ETCD C++ client library not found. Disabling ETCD runtime.')
+endif
+
+# Add libnuma if available
+if numa_dep.found()
+    message('libnuma found - NUMA-aware resource allocation enabled')
+else
+    message('libnuma not found - NUMA-aware resource allocation disabled')
 endif
 
 etcd_inc = etcd_inc_path
@@ -171,6 +181,12 @@ configure_file(
 
 deps = [nixl_lib, nixl_build, nixl_serdes, openmp_dep, cxxopts_dep, tomlplusplus_dep]
 args = []
+
+# Add libnuma if available
+if numa_dep.found()
+    deps += [numa_dep]
+endif
+
 if etcd_available
     deps += [etcd_dep]
 endif
