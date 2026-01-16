@@ -1469,19 +1469,12 @@ nixlLibfabricEngine::getNotifs(notif_list_t &notif_list) {
     // Thread-safe access to internal notification list
     {
         std::lock_guard<std::mutex> lock(notif_mutex_);
-
-        // Move all notifications from internal list to user's list
-        notif_list.insert(notif_list.end(), notifMainList_.begin(), notifMainList_.end());
-
         if (!notifMainList_.empty()) {
-            NIXL_DEBUG << "Retrieved " << notifMainList_.size() << " notifications";
-            // Clear the internal list after copying
-            notifMainList_.clear();
+            size_t num_notifs = notifMainList_.size();
+            notif_list.swap(notifMainList_);  // O(1) swap
+            NIXL_DEBUG << "Retrieved " << num_notifs << " notifications";
             return NIXL_SUCCESS;
         }
-
-        // Clear the internal list after copying (even if empty)
-        notifMainList_.clear();
     }
 
     return NIXL_IN_PROG;
