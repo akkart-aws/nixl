@@ -42,9 +42,10 @@ public:
      * network devices
      * @param striping_threshold Size threshold for enabling multi-rail striping
      * @param progress_thread_enabled Whether progress threads are enabled
+     * @param device_id Optional GPU device ID for selective rail creation (-1 = create all rails)
      * @throws std::runtime_error if initialization fails
      */
-    nixlLibfabricRailManager(size_t striping_threshold, bool progress_thread_enabled = false);
+    nixlLibfabricRailManager(size_t striping_threshold, bool progress_thread_enabled = false, int device_id = -1);
     /** Destroy rail manager and cleanup all resources */
     ~nixlLibfabricRailManager();
 
@@ -204,12 +205,20 @@ public:
         CONNECTION_ACK, ///< Connection acknowledgment
         DISCONNECT_REQ, ///< Disconnection request
     };
-    /** Post control request via control rail
+    
+    /** Rail selection for control messages */
+    enum class RailSelection {
+        CONTROL_RAIL, ///< Use control rail (for connection management)
+        DATA_RAIL,    ///< Use data rail (for notifications)
+    };
+    
+    /** Post control request via control or data rail
      * @param msg_type Type of control message
      * @param req Control request with data buffer
      * @param dest_addr Destination address
      * @param agent_idx Agent index for message routing
      * @param completion_callback Optional completion callback
+     * @param rail_selection Rail type to use (CONTROL_RAIL or DATA_RAIL)
      * @return NIXL_SUCCESS on success, error code on failure
      */
     nixl_status_t
@@ -217,7 +226,8 @@ public:
                        nixlLibfabricReq *req,
                        fi_addr_t dest_addr,
                        uint16_t agent_idx = 0,
-                       std::function<void()> completion_callback = nullptr);
+                       std::function<void()> completion_callback = nullptr,
+                       RailSelection rail_selection = RailSelection::CONTROL_RAIL);
     // Progress APIs
     /** Process completions on active data rails only (optimized for CPU overhead)
      * @return NIXL_SUCCESS if completions processed, NIXL_IN_PROG if none, error on failure

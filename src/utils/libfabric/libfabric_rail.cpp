@@ -555,18 +555,18 @@ nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
             }
 #endif
 
-            size_t rnr_retry = 7; // EFA_RNR_INFINITE_RETRY
-            ret = fi_setopt(&endpoint->fid,
-                            FI_OPT_ENDPOINT,
-                            FI_OPT_EFA_RNR_RETRY,
-                            &rnr_retry,
-                            sizeof(rnr_retry));
-            if (ret) {
-                NIXL_WARN << "fi_setopt FI_OPT_EFA_RNR_RETRY failed for rail " << rail_id << ": "
-                          << fi_strerror(-ret) << " - continuing with default";
-            } else {
-                NIXL_INFO << "Set RNR retry to infinite (7) for rail " << rail_id;
-            }
+            // size_t rnr_retry = 7; // EFA_RNR_INFINITE_RETRY
+            // ret = fi_setopt(&endpoint->fid,
+            //                 FI_OPT_ENDPOINT,
+            //                 FI_OPT_EFA_RNR_RETRY,
+            //                 &rnr_retry,
+            //                 sizeof(rnr_retry));
+            // if (ret) {
+            //     NIXL_WARN << "fi_setopt FI_OPT_EFA_RNR_RETRY failed for rail " << rail_id << ": "
+            //               << fi_strerror(-ret) << " - continuing with default";
+            // } else {
+            //     NIXL_INFO << "Set RNR retry to infinite (7) for rail " << rail_id;
+            // }
         }
 
         // Enable endpoint for this rail

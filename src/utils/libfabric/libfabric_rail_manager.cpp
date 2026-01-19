@@ -38,32 +38,70 @@ static std::atomic<size_t> round_robin_counter{0};
 static const std::string NUM_RAILS_TAG{"num_rails"};
 
 nixlLibfabricRailManager::nixlLibfabricRailManager(size_t striping_threshold,
-                                                   bool progress_thread_enabled)
+                                                   bool progress_thread_enabled,
+                                                   int device_id)
     : striping_threshold_(striping_threshold),
       progress_thread_enabled_(progress_thread_enabled) {
     NIXL_DEBUG << "Creating rail manager with striping threshold: " << striping_threshold_
-               << " bytes, progress_thread_enabled: " << progress_thread_enabled_;
+               << " bytes, progress_thread_enabled: " << progress_thread_enabled_
+               << ", device_id: " << device_id;
 
     // Initialize topology system
     topology = std::make_unique<nixlLibfabricTopology>();
 
-    // Get network devices from topology and create rails automatically
-    std::vector<std::string> all_devices = topology->getAllDevices();
-
     std::string selected_provider_name = topology->getProviderName();
+    std::vector<std::string> devices_to_use;
 
-    NIXL_DEBUG << "Got " << all_devices.size()
+    // Selective rail creation based on device_id
+    if (device_id >= 0) {
+#ifdef HAVE_CUDA
+        // Get PCI bus ID for the specified GPU device
+        char pci_buf[32];
+        CUresult pci_result = cuDeviceGetPCIBusId(pci_buf, sizeof(pci_buf), device_id);
+        if (pci_result != CUDA_SUCCESS) {
+            NIXL_ERROR << "Failed to get PCI bus ID for GPU device " << device_id;
+            throw std::runtime_error("Failed to get PCI bus ID for GPU device");
+        }
+        std::string gpu_pci_bus_id(pci_buf);
+        
+        NIXL_DEBUG << "GPU device " << device_id << " has PCI bus ID: " << gpu_pci_bus_id;
+        
+        // Get EFA devices for this GPU
+        devices_to_use = topology->getEfaDevicesForGPUPci(gpu_pci_bus_id);
+        
+        if (devices_to_use.empty()) {
+            NIXL_WARN << "No EFA devices found for GPU " << device_id
+                      << " (PCI: " << gpu_pci_bus_id << "), falling back to all devices";
+            devices_to_use = topology->getAllDevices();
+        } else {
+            NIXL_DEBUG << "Selected " << devices_to_use.size()
+                       << " EFA device(s) for GPU " << device_id;
+        }
+#else
+        NIXL_WARN << "CUDA not available, ignoring device_id parameter and creating all rails";
+        devices_to_use = topology->getAllDevices();
+#endif
+    } else {
+        // Create all rails (backward compatibility)
+        devices_to_use = topology->getAllDevices();
+        NIXL_DEBUG << "No device_id specified, creating rails for all "
+                   << devices_to_use.size() << " devices";
+    }
+
+    NIXL_DEBUG << "Got " << devices_to_use.size()
                << " network devices from topology for provider=" << selected_provider_name;
 
     // Create data rails with selected provider - throw on failure
-    nixl_status_t rail_status = createDataRails(all_devices, selected_provider_name);
+    nixl_status_t rail_status = createDataRails(devices_to_use, selected_provider_name);
     if (rail_status != NIXL_SUCCESS) {
         throw std::runtime_error("Failed to create data rails for libfabric rail manager");
     }
 
     // Create control rails with selected provider - throw on failure
+    // Control rails always use the first device
+    std::vector<std::string> control_devices = {devices_to_use[0]};
     nixl_status_t control_rail_status = createControlRails(
-        all_devices, selected_provider_name, NIXL_LIBFABRIC_DEFAULT_CONTROL_RAILS);
+        control_devices, selected_provider_name, NIXL_LIBFABRIC_DEFAULT_CONTROL_RAILS);
     if (control_rail_status != NIXL_SUCCESS) {
         throw std::runtime_error("Failed to create control rails for libfabric rail manager");
     }
@@ -524,10 +562,16 @@ nixlLibfabricRailManager::postControlRequest(ControlMessageType msg_type,
                                              nixlLibfabricReq *req,
                                              fi_addr_t dest_addr,
                                              uint16_t agent_idx,
-                                             std::function<void()> completion_callback) {
+                                             std::function<void()> completion_callback,
+                                             RailSelection rail_selection) {
     // Validation
-    if (control_rails_.empty()) {
+    if (rail_selection == RailSelection::CONTROL_RAIL && control_rails_.empty()) {
         NIXL_ERROR << "No control rails available";
+        return NIXL_ERR_INVALID_PARAM;
+    }
+    
+    if (rail_selection == RailSelection::DATA_RAIL && data_rails_.empty()) {
+        NIXL_ERROR << "No data rails available";
         return NIXL_ERR_INVALID_PARAM;
     }
 
@@ -554,7 +598,9 @@ nixlLibfabricRailManager::postControlRequest(ControlMessageType msg_type,
         NIXL_ERROR << "Unknown message type";
         return NIXL_ERR_INVALID_PARAM;
     }
+    
     size_t control_rail_id = 0;
+    size_t data_rail_id = 0;
     uint32_t xfer_id = req->xfer_id;
     // For control messages, use SEQ_ID 0 since they don't need sequence tracking
     // TODO: Add sequencing for connection establishment workflow.
@@ -567,19 +613,34 @@ nixlLibfabricRailManager::postControlRequest(ControlMessageType msg_type,
         NIXL_DEBUG << "Set completion callback for control message request " << req->xfer_id;
     }
 
-    NIXL_DEBUG << "Sending control message type " << msg_type_value << " agent_idx=" << agent_idx
-               << " XFER_ID=" << xfer_id << " imm_data=" << req->immediate_data;
-
-    // Rail postSend
-    nixl_status_t status = control_rails_[control_rail_id]->postSend(req);
-
-    if (status != NIXL_SUCCESS) {
-        NIXL_ERROR << "Failed to send control message type " << static_cast<int>(msg_type)
-                   << " on control rail " << control_rail_id;
-        // Release the pre-allocated control request back to pool on failure
-        control_rails_[control_rail_id]->releaseRequest(req);
-        return status;
+    // Rail selection based on parameter
+    nixl_status_t status;
+    if (rail_selection == RailSelection::DATA_RAIL) {
+        NIXL_DEBUG << "Sending control message type " << msg_type_value << " agent_idx=" << agent_idx
+                   << " XFER_ID=" << xfer_id << " on DATA rail " << data_rail_id;
+        status = data_rails_[data_rail_id]->postSend(req);
+        
+        if (status != NIXL_SUCCESS) {
+            NIXL_ERROR << "Failed to send control message type " << static_cast<int>(msg_type)
+                       << " on data rail " << data_rail_id;
+            // Release the pre-allocated request back to data rail pool on failure
+            data_rails_[data_rail_id]->releaseRequest(req);
+            return status;
+        }
+    } else {
+        NIXL_DEBUG << "Sending control message type " << msg_type_value << " agent_idx=" << agent_idx
+                   << " XFER_ID=" << xfer_id << " on CONTROL rail " << control_rail_id;
+        status = control_rails_[control_rail_id]->postSend(req);
+        
+        if (status != NIXL_SUCCESS) {
+            NIXL_ERROR << "Failed to send control message type " << static_cast<int>(msg_type)
+                       << " on control rail " << control_rail_id;
+            // Release the pre-allocated control request back to control rail pool on failure
+            control_rails_[control_rail_id]->releaseRequest(req);
+            return status;
+        }
     }
+    
     return NIXL_SUCCESS;
 }
 

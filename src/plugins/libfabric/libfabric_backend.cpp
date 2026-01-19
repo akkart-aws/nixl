@@ -243,7 +243,23 @@ nixlLibfabricEngine::nixlLibfabricEngine(const nixlBackendInitParams *init_param
       cm_thread_stop_(false),
       progress_thread_enabled_(init_params->enableProgTh),
       progress_thread_delay_(std::chrono::microseconds(init_params->pthrDelay)),
-      rail_manager(NIXL_LIBFABRIC_DEFAULT_STRIPING_THRESHOLD, init_params->enableProgTh) {
+      rail_manager(NIXL_LIBFABRIC_DEFAULT_STRIPING_THRESHOLD, init_params->enableProgTh,
+                   [this]() -> int {
+                       std::string device_id_str;
+                       if (getInitParam("device_id", device_id_str) == NIXL_SUCCESS) {
+                           try {
+                               int device_id = std::stoi(device_id_str);
+                               NIXL_DEBUG << "Using device_id from backend params: " << device_id;
+                               return device_id;
+                           } catch (const std::exception &e) {
+                               NIXL_WARN << "Invalid device_id value '" << device_id_str
+                                         << "', creating all rails";
+                               return -1;
+                           }
+                       }
+                       NIXL_DEBUG << "No device_id specified, creating all rails";
+                       return -1;
+                   }()) {
 
     NIXL_DEBUG << "Initializing Libfabric Backend with GPU Support";
     progress_thread_delay_ = std::chrono::microseconds(10);
@@ -284,13 +300,15 @@ nixlLibfabricEngine::nixlLibfabricEngine(const nixlBackendInitParams *init_param
                    << " data rails and " << rail_manager.getNumControlRails() << " control rails";
 
         // Set up callbacks on each rail using Engine's static callback functions
-        size_t control_rail_id = 0;
+        // Set up notification callbacks on data rails for receiving notifications
+        size_t data_rail_id = 0;
         NIXL_DEBUG << "Set notification processor for control rail 0";
-        rail_manager.getControlRail(control_rail_id)
+        rail_manager.getDataRail(data_rail_id)
             .setNotificationCallback([this](const std::string &serialized_notif) {
                 processNotification(serialized_notif);
             });
 
+        size_t control_rail_id = 0;
         // Set up connection state callbacks for control rails
         NIXL_DEBUG << "Set connection state processor for CM rail 0";
 
@@ -1310,7 +1328,7 @@ nixlLibfabricEngine::notifSendPriv(const std::string &remote_agent,
     }
 
     auto connection = it->second;
-    const size_t control_rail_id = 0; // Only use control rail 0 for notifications
+    const size_t data_rail_id = 0; // Use data rail 0 for notifications
 
     NIXL_DEBUG << "Sending " << binary_notifications.size() << " notification fragments"
                << " total_message_length=" << total_message_length;
@@ -1332,9 +1350,9 @@ nixlLibfabricEngine::notifSendPriv(const std::string &remote_agent,
                 total_message_length, expected_completions, metadata.agent_name_length);
         }
 
-        // Allocate control request for this notification fragment
+        // Allocate control request for this notification fragment from data rail
         size_t max_size = BinaryNotification::MAX_FRAGMENT_SIZE;
-        nixlLibfabricReq *control_request = rail_manager.getControlRail(control_rail_id)
+        nixlLibfabricReq *control_request = rail_manager.getDataRail(data_rail_id)
                                                 .allocateControlRequest(max_size, notif_xfer_id);
 
         if (!control_request) {
@@ -1354,11 +1372,13 @@ nixlLibfabricEngine::notifSendPriv(const std::string &remote_agent,
         nixl_status_t status = rail_manager.postControlRequest(
             nixlLibfabricRailManager::ControlMessageType::NOTIFICATION,
             control_request,
-            connection->control_rail_remote_addr_list_[control_rail_id][0],
-            connection->agent_index_);
+            connection->rail_remote_addr_list_[data_rail_id][0],
+            connection->agent_index_,
+            nullptr,
+            nixlLibfabricRailManager::RailSelection::DATA_RAIL);
 
         if (status != NIXL_SUCCESS) {
-            NIXL_ERROR << "postControlRequest failed on control rail " << control_rail_id
+            NIXL_ERROR << "postControlRequest failed on data rail " << data_rail_id
                        << " for fragment " << seq_id;
             return NIXL_ERR_BACKEND;
         }
