@@ -124,6 +124,11 @@ private:
     size_t num_connected_rails_; // Number of successfully connected rails
     std::string initiator_addr_; // Local endpoint address
     std::string remote_addr_; // Remote endpoint address
+    
+    // Notification buffer metadata for writedata-based notifications (per rail)
+    // Key: rail_id, Value: tuple<remote_addr, remote_key, buffer_size>
+    std::unordered_map<size_t, std::tuple<uint64_t, uint64_t, size_t>> rail_notif_buffer_info_;
+    
 public:
     friend class nixlLibfabricEngine;
     friend class nixlLibfabricRail;
@@ -144,6 +149,9 @@ public:
     uint32_t total_notif_msg_len; // Total length of notification message across all fragments
 
     std::vector<BinaryNotification> binary_notifs; // Vector of BinaryNotification for fragmentation
+    
+    // NOTE: Notification buffers are now owned by the rail (not per-handle)
+    // Rail has pre-allocated sender buffer pool that is shared across all handles
 
     nixlLibfabricBackendH(nixl_xfer_op_t op, const std::string &remote_agent);
     ~nixlLibfabricBackendH();
@@ -264,7 +272,8 @@ private:
                   std::vector<BinaryNotification> &binary_notifications,
                   uint32_t total_message_length,
                   uint16_t notif_xfer_id,
-                  uint32_t expected_completions) const;
+                  uint32_t expected_completions,
+                  nixlLibfabricBackendH *handle = nullptr) const;
 
     // Private function to fragment notification messages to binary notifications
     void

@@ -377,6 +377,32 @@ public:
     fi_info *
     getRailInfo() const;
 
+    // Notification buffer accessor methods
+    /** Get notification buffer remote addresses for metadata exchange */
+    const std::vector<uint64_t> &
+    getNotificationBufferAddrs() const;
+
+    /** Get notification buffer remote keys for metadata exchange */
+    const std::vector<uint64_t> &
+    getNotificationBufferKeys() const;
+
+    /** Get notification buffer size for metadata exchange */
+    size_t
+    getNotificationBufferSize() const;
+    
+    /** Get number of notification buffers */
+    size_t
+    getNumNotificationBuffers() const;
+
+    // Sender notification buffer accessor methods
+    /** Get sender notification buffer pointer for specified index */
+    void *
+    getSenderNotifBuffer(size_t index) const;
+
+    /** Get sender notification buffer MR for specified index */
+    struct fid_mr *
+    getSenderNotifMR(size_t index) const;
+
 private:
     // Core libfabric resources
     struct fi_info *info; // from rail_infos[rail_id]
@@ -404,6 +430,20 @@ private:
     // Provider capability flags
     bool provider_supports_hmem_;
 
+    // Receiver-side notification buffer pool for writedata-based notifications (multiple buffers per rail)
+    void *notif_contiguous_block_;                ///< Contiguous memory block for all notification buffers
+    std::vector<void *> notif_buffers_;           ///< Pointers into contiguous block (one per buffer)
+    std::vector<struct fid_mr *> notif_mrs_;      ///< Memory registration handles for each buffer
+    std::vector<uint64_t> notif_keys_;            ///< Remote access keys for each buffer
+    std::vector<uint64_t> notif_remote_addrs_;    ///< Remote addresses for metadata exchange
+    size_t notif_buffer_size_;                    ///< Size of each buffer (BinaryNotification::MAX_FRAGMENT_SIZE)
+    size_t num_notif_buffers_;                    ///< Number of buffers in the pool
+
+    // Sender-side notification buffer pool (for writedata operations)
+    void *sender_notif_contiguous_block_;         ///< Contiguous memory block for all sender notification buffers
+    std::vector<void *> sender_notif_buffers_;    ///< Pointers into contiguous block (one per buffer)
+    std::vector<struct fid_mr *> sender_notif_mrs_; ///< Memory registration handles for each sender buffer
+    std::vector<uint64_t> sender_notif_keys_;     ///< Remote access keys for each sender buffer
 
     nixl_status_t
     processCompletionQueueEntry(struct fi_cq_data_entry *comp) const;

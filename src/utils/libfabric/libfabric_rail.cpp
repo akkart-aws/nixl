@@ -393,7 +393,10 @@ nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
       progress_thread_enabled_(progress_thread_enabled),
       control_request_pool_(NIXL_LIBFABRIC_CONTROL_REQUESTS_PER_RAIL, id),
       data_request_pool_(NIXL_LIBFABRIC_DATA_REQUESTS_PER_RAIL, id),
-      provider_supports_hmem_(false) {
+      provider_supports_hmem_(false),
+      notif_contiguous_block_(nullptr),
+      num_notif_buffers_(NIXL_LIBFABRIC_NUM_NOTIF_BUFFERS),
+      sender_notif_contiguous_block_(nullptr) {
     // Initialize all pointers to nullptr
     info = nullptr;
     fabric = nullptr;
@@ -601,6 +604,130 @@ nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
                    << " control requests, " << NIXL_LIBFABRIC_DATA_REQUESTS_PER_RAIL
                    << " data requests for rail " << rail_id;
 
+        // Initialize receiver-side notification buffer pool for writedata-based notifications
+        size_t buffer_size = NIXL_LIBFABRIC_SEND_RECV_BUFFER_SIZE; // Same as BinaryNotification::MAX_FRAGMENT_SIZE
+        
+        notif_buffers_.resize(num_notif_buffers_);
+        notif_mrs_.resize(num_notif_buffers_);
+        notif_keys_.resize(num_notif_buffers_);
+        notif_remote_addrs_.resize(num_notif_buffers_);
+        
+        // Allocate ONE contiguous block for all notification buffers
+        // This ensures that offset-based addressing works correctly
+        size_t total_buffer_size = num_notif_buffers_ * buffer_size;
+        notif_contiguous_block_ = malloc(total_buffer_size);
+        if (!notif_contiguous_block_) {
+            NIXL_ERROR << "Failed to allocate contiguous notification buffer block for rail " << rail_id
+                       << " size=" << total_buffer_size;
+            throw std::runtime_error("Failed to allocate contiguous notification buffer block for rail " +
+                                     std::to_string(rail_id));
+        }
+        memset(notif_contiguous_block_, 0, total_buffer_size);
+        
+        NIXL_INFO << "Allocated contiguous receiver notification buffer block for rail " << rail_id
+                  << " base_addr=" << notif_contiguous_block_
+                  << " total_size=" << total_buffer_size
+                  << " num_buffers=" << num_notif_buffers_
+                  << " buffer_size=" << buffer_size;
+        
+        // Assign buffer pointers into the contiguous block and register each buffer
+        for (size_t i = 0; i < num_notif_buffers_; ++i) {
+            // Calculate buffer address within contiguous block
+            notif_buffers_[i] = static_cast<char*>(notif_contiguous_block_) + (i * buffer_size);
+            
+            // Register buffer with libfabric for remote write access
+            ret = fi_mr_reg(domain, notif_buffers_[i], buffer_size,
+                           FI_REMOTE_WRITE, 0, 0, 0, &notif_mrs_[i], NULL);
+            if (ret) {
+                NIXL_ERROR << "fi_mr_reg failed for receiver notification buffer " << i << " on rail " << rail_id
+                           << ": " << fi_strerror(-ret);
+                // Cleanup already registered buffers
+                for (size_t j = 0; j < i; ++j) {
+                    if (notif_mrs_[j]) fi_close(&notif_mrs_[j]->fid);
+                }
+                // Free the entire contiguous block
+                free(notif_contiguous_block_);
+                notif_contiguous_block_ = nullptr;
+                throw std::runtime_error("Failed to register receiver notification buffer pool for rail " +
+                                         std::to_string(rail_id));
+            }
+            
+            notif_keys_[i] = fi_mr_key(notif_mrs_[i]);
+            notif_remote_addrs_[i] = reinterpret_cast<uint64_t>(notif_buffers_[i]);
+            
+            NIXL_DEBUG << "Registered receiver notification buffer[" << i << "] for rail " << rail_id
+                       << " addr=" << notif_buffers_[i]
+                       << " offset_from_base=" << (i * buffer_size)
+                       << " key=" << notif_keys_[i];
+        }
+
+        NIXL_INFO << "Initialized receiver notification buffer pool for rail " << rail_id
+                  << " num_buffers=" << num_notif_buffers_
+                  << " buffer_size=" << buffer_size
+                  << " total_memory=" << total_buffer_size
+                  << " base_addr=" << notif_buffers_[0]
+                  << " last_addr=" << notif_buffers_[num_notif_buffers_ - 1]
+                  << " contiguous=YES";
+
+        // Initialize sender-side notification buffer pool (for writedata operations)
+        sender_notif_buffers_.resize(num_notif_buffers_);
+        sender_notif_mrs_.resize(num_notif_buffers_);
+        sender_notif_keys_.resize(num_notif_buffers_);
+        
+        // Allocate ONE contiguous block for all sender notification buffers
+        sender_notif_contiguous_block_ = malloc(total_buffer_size);
+        if (!sender_notif_contiguous_block_) {
+            NIXL_ERROR << "Failed to allocate contiguous sender notification buffer block for rail " << rail_id
+                       << " size=" << total_buffer_size;
+            throw std::runtime_error("Failed to allocate contiguous sender notification buffer block for rail " +
+                                     std::to_string(rail_id));
+        }
+        memset(sender_notif_contiguous_block_, 0, total_buffer_size);
+        
+        NIXL_INFO << "Allocated contiguous sender notification buffer block for rail " << rail_id
+                  << " base_addr=" << sender_notif_contiguous_block_
+                  << " total_size=" << total_buffer_size
+                  << " num_buffers=" << num_notif_buffers_
+                  << " buffer_size=" << buffer_size;
+        
+        // Assign sender buffer pointers and register each buffer
+        for (size_t i = 0; i < num_notif_buffers_; ++i) {
+            // Calculate buffer address within contiguous block
+            sender_notif_buffers_[i] = static_cast<char*>(sender_notif_contiguous_block_) + (i * buffer_size);
+            
+            // Register buffer with libfabric for local write operations (FI_WRITE for fi_writedata)
+            ret = fi_mr_reg(domain, sender_notif_buffers_[i], buffer_size,
+                           FI_WRITE, 0, 0, 0, &sender_notif_mrs_[i], NULL);
+            if (ret) {
+                NIXL_ERROR << "fi_mr_reg failed for sender notification buffer " << i << " on rail " << rail_id
+                           << ": " << fi_strerror(-ret);
+                // Cleanup already registered sender buffers
+                for (size_t j = 0; j < i; ++j) {
+                    if (sender_notif_mrs_[j]) fi_close(&sender_notif_mrs_[j]->fid);
+                }
+                // Free the sender contiguous block
+                free(sender_notif_contiguous_block_);
+                sender_notif_contiguous_block_ = nullptr;
+                throw std::runtime_error("Failed to register sender notification buffer pool for rail " +
+                                         std::to_string(rail_id));
+            }
+            
+            sender_notif_keys_[i] = fi_mr_key(sender_notif_mrs_[i]);
+            
+            NIXL_DEBUG << "Registered sender notification buffer[" << i << "] for rail " << rail_id
+                       << " addr=" << sender_notif_buffers_[i]
+                       << " offset_from_base=" << (i * buffer_size)
+                       << " key=" << sender_notif_keys_[i];
+        }
+
+        NIXL_INFO << "Initialized sender notification buffer pool for rail " << rail_id
+                  << " num_buffers=" << num_notif_buffers_
+                  << " buffer_size=" << buffer_size
+                  << " total_memory=" << total_buffer_size
+                  << " base_addr=" << sender_notif_buffers_[0]
+                  << " last_addr=" << sender_notif_buffers_[num_notif_buffers_ - 1]
+                  << " contiguous=YES";
+
         // Post initial pool of receives using new resource management system
         NIXL_INFO << "Pre-posting " << NIXL_LIBFABRIC_RECV_POOL_SIZE << " recv requests for rail "
                   << rail_id;
@@ -676,11 +803,66 @@ nixlLibfabricRail::cleanup() {
         av = nullptr;
     }
 
-    // STEP 3: Clean up request pools while domain is still valid
+    // STEP 3: Clean up notification buffer pools while domain is still valid
+    
+    // Clean up receiver-side notification buffer pool
+    for (size_t i = 0; i < notif_mrs_.size(); ++i) {
+        if (notif_mrs_[i]) {
+            NIXL_TRACE << "Closing receiver notification buffer MR " << i << " for rail " << rail_id;
+            int ret = fi_close(&notif_mrs_[i]->fid);
+            if (ret) {
+                NIXL_WARN << "fi_close receiver notification buffer MR " << i << " failed for rail " << rail_id << ": "
+                          << fi_strerror(-ret);
+            }
+            notif_mrs_[i] = nullptr;
+        }
+    }
+
+    // Free the receiver contiguous block (not individual buffers)
+    if (notif_contiguous_block_) {
+        NIXL_TRACE << "Freeing contiguous receiver notification buffer block for rail " << rail_id
+                   << " addr=" << notif_contiguous_block_;
+        free(notif_contiguous_block_);
+        notif_contiguous_block_ = nullptr;
+    }
+    
+    // Clear receiver vectors (buffer pointers are now invalid)
+    notif_buffers_.clear();
+    notif_mrs_.clear();
+    notif_keys_.clear();
+    notif_remote_addrs_.clear();
+
+    // Clean up sender-side notification buffer pool
+    for (size_t i = 0; i < sender_notif_mrs_.size(); ++i) {
+        if (sender_notif_mrs_[i]) {
+            NIXL_TRACE << "Closing sender notification buffer MR " << i << " for rail " << rail_id;
+            int ret = fi_close(&sender_notif_mrs_[i]->fid);
+            if (ret) {
+                NIXL_WARN << "fi_close sender notification buffer MR " << i << " failed for rail " << rail_id << ": "
+                          << fi_strerror(-ret);
+            }
+            sender_notif_mrs_[i] = nullptr;
+        }
+    }
+
+    // Free the sender contiguous block
+    if (sender_notif_contiguous_block_) {
+        NIXL_TRACE << "Freeing contiguous sender notification buffer block for rail " << rail_id
+                   << " addr=" << sender_notif_contiguous_block_;
+        free(sender_notif_contiguous_block_);
+        sender_notif_contiguous_block_ = nullptr;
+    }
+    
+    // Clear sender vectors
+    sender_notif_buffers_.clear();
+    sender_notif_mrs_.clear();
+    sender_notif_keys_.clear();
+
+    // STEP 4: Clean up request pools while domain is still valid
     // This ensures all memory registrations (MRs) are properly deregistered before domain closure
     NIXL_TRACE << "Cleaning up request pools for rail " << rail_id;
     control_request_pool_.cleanup();
-    // STEP 4: Close domain AFTER all MRs, endpoint, CQ, AV are closed
+    // STEP 5: Close domain AFTER all MRs, endpoint, CQ, AV are closed
     if (domain) {
         NIXL_TRACE << "Closing domain for rail " << rail_id;
         int ret = fi_close(&domain->fid);
@@ -689,7 +871,7 @@ nixlLibfabricRail::cleanup() {
         }
         domain = nullptr;
     }
-    // STEP 5: Close fabric
+    // STEP 6: Close fabric
     if (fabric) {
         NIXL_TRACE << "Closing fabric for rail " << rail_id;
         int ret = fi_close(&fabric->fid);
@@ -698,7 +880,7 @@ nixlLibfabricRail::cleanup() {
         }
         fabric = nullptr;
     }
-    // STEP 6: Free info structure
+    // STEP 7: Free info structure
     if (info) {
         NIXL_INFO << "Freeing info structure for rail " << rail_id;
         fi_freeinfo(info);
@@ -1010,13 +1192,19 @@ nixlLibfabricRail::processRecvCompletion(struct fi_cq_data_entry *comp) const {
     return NIXL_SUCCESS;
 }
 
-// Handle remote write completions (data arrival notification)
+// Handle remote write completions (data arrival notification and writedata-based notifications)
 nixl_status_t
 nixlLibfabricRail::processRemoteWriteCompletion(struct fi_cq_data_entry *comp) const {
     // Decode the immediate data format
     uint64_t msg_type = NIXL_GET_MSG_TYPE_FROM_IMM(comp->data);
     uint16_t agent_idx = NIXL_GET_AGENT_INDEX_FROM_IMM(comp->data);
     uint32_t xfer_id = NIXL_GET_XFER_ID_FROM_IMM(comp->data);
+    uint16_t seq_id = NIXL_GET_SEQ_ID_FROM_IMM(comp->data);
+    
+    NIXL_DEBUG << "processRemoteWriteCompletion on rail " << rail_id
+               << " msg_type=" << msg_type << " agent_idx=" << agent_idx
+               << " xfer_id=" << xfer_id << " seq_id=" << seq_id
+               << " imm_data=" << std::hex << comp->data << std::dec;
 
     // For remote write completions, we don't need to post a new receive
     // The write operation doesn't consume a receive buffer
@@ -1033,7 +1221,55 @@ nixlLibfabricRail::processRemoteWriteCompletion(struct fi_cq_data_entry *comp) c
             NIXL_ERROR << "No XFER_ID callback set for rail " << rail_id;
             return NIXL_ERR_BACKEND;
         }
+    } else if (msg_type == NIXL_LIBFABRIC_MSG_NOTIFICTION) {
+        // Handle writedata-based notification
+        NIXL_INFO << "NOTIF_RECV: FI_REMOTE_WRITE completion on rail " << rail_id
+                  << " received=" << comp->len << " bytes"
+                  << " agent_idx=" << agent_idx << " xfer_id=" << xfer_id
+                  << " seq_id=" << seq_id << " imm_data=" << std::hex << comp->data << std::dec;
+
+        // Calculate buffer index using xfer_id modulo number of buffers
+        size_t buffer_idx = xfer_id % num_notif_buffers_;
+        
+        NIXL_INFO << "NOTIF_RECV: Using buffer_idx=" << buffer_idx << " for xfer_id=" << xfer_id
+                  << " (xfer_id % " << num_notif_buffers_ << ")";
+
+        // Validate buffer index and state
+        if (buffer_idx >= notif_buffers_.size() || !notif_buffers_[buffer_idx]) {
+            NIXL_ERROR << "Invalid notification buffer index " << buffer_idx << " on rail " << rail_id
+                       << " xfer_id=" << xfer_id << " num_buffers=" << num_notif_buffers_;
+            return NIXL_ERR_BACKEND;
+        }
+        
+        if (comp->len > NIXL_LIBFABRIC_SEND_RECV_BUFFER_SIZE) {
+            NIXL_ERROR << "Notification length " << comp->len << " exceeds buffer size "
+                       << NIXL_LIBFABRIC_SEND_RECV_BUFFER_SIZE << " on rail " << rail_id;
+            return NIXL_ERR_BACKEND;
+        }
+
+        // Create a copy of the notification data from the correct buffer
+        std::string notification_data(static_cast<char*>(notif_buffers_[buffer_idx]), comp->len);
+
+        NIXL_INFO << "NOTIF_RECV: Copied data from buffer[" << buffer_idx << "]: size=" << notification_data.size()
+                  << " xfer_id=" << xfer_id << " seq_id=" << seq_id;
+
+        // Clear the buffer immediately after copying to prevent reading stale data
+        memset(notif_buffers_[buffer_idx], 0, NIXL_LIBFABRIC_SEND_RECV_BUFFER_SIZE);
+
+        // Call notification callback with the copied data
+        if (notificationCallback) {
+            notificationCallback(notification_data);
+            NIXL_INFO << "NOTIF_RECV: Callback invoked for xfer_id=" << xfer_id
+                      << " seq_id=" << seq_id << " buffer_idx=" << buffer_idx;
+        } else {
+            NIXL_ERROR << "No notification callback set for rail " << rail_id;
+            return NIXL_ERR_BACKEND;
+        }
+    } else {
+        NIXL_WARN << "Unknown message type in remote write completion: " << msg_type
+                  << " on rail " << rail_id;
     }
+    
     return NIXL_SUCCESS;
 }
 
@@ -1550,4 +1786,46 @@ nixlLibfabricRail::setProgressThreadEnabled(bool enabled) {
 fi_info *
 nixlLibfabricRail::getRailInfo() const {
     return info;
+}
+
+// Notification buffer accessor methods
+
+const std::vector<uint64_t> &
+nixlLibfabricRail::getNotificationBufferAddrs() const {
+    return notif_remote_addrs_;
+}
+
+const std::vector<uint64_t> &
+nixlLibfabricRail::getNotificationBufferKeys() const {
+    return notif_keys_;
+}
+
+size_t
+nixlLibfabricRail::getNotificationBufferSize() const {
+    return NIXL_LIBFABRIC_SEND_RECV_BUFFER_SIZE;
+}
+
+size_t
+nixlLibfabricRail::getNumNotificationBuffers() const {
+    return num_notif_buffers_;
+}
+
+// Sender notification buffer accessor methods
+
+void *
+nixlLibfabricRail::getSenderNotifBuffer(size_t index) const {
+    if (index >= sender_notif_buffers_.size()) {
+        NIXL_ERROR << "Invalid sender buffer index " << index << " on rail " << rail_id;
+        return nullptr;
+    }
+    return sender_notif_buffers_[index];
+}
+
+struct fid_mr *
+nixlLibfabricRail::getSenderNotifMR(size_t index) const {
+    if (index >= sender_notif_mrs_.size()) {
+        NIXL_ERROR << "Invalid sender MR index " << index << " on rail " << rail_id;
+        return nullptr;
+    }
+    return sender_notif_mrs_[index];
 }

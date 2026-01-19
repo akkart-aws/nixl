@@ -289,18 +289,19 @@ public:
                           std::vector<uint64_t> &keys_out,
                           uint64_t &remote_addr_out) const;
     // SerDes-based Connection Info Serialization
-    /** Serialize connection information for all rails
+    /** Serialize connection information for all rails (includes notification buffer metadata)
      * @param user_prefix Prefix for serialization keys (e.g., "src" or "dest")
-     * @param str Serialized connection information
+     * @param str Serialized connection information including notification buffers
      * @return NIXL_SUCCESS on success, error code on failure
      */
     nixl_status_t
     serializeConnectionInfo(const std::string &user_prefix, std::string &str) const;
-    /** Deserialize connection information for all rails
+    /** Deserialize connection information for all rails (includes notification buffer metadata)
      * @param user_prefix Prefix used during serialization
-     * @param serialized_data Serialized connection information
+     * @param serialized_data Serialized connection information including notification buffers
      * @param data_endpoints_out Data rail endpoint addresses
      * @param control_endpoints_out Control rail endpoint addresses
+     * @param notif_buffers_out Notification buffer info (addr, key, size) per rail
      * @return NIXL_SUCCESS on success, error code on failure
      */
     nixl_status_t
@@ -308,7 +309,8 @@ public:
         const std::string &user_prefix,
         const std::string &serialized_data,
         std::vector<std::array<char, LF_EP_NAME_MAX_LEN>> &data_endpoints_out,
-        std::vector<std::array<char, LF_EP_NAME_MAX_LEN>> &control_endpoints_out) const;
+        std::vector<std::array<char, LF_EP_NAME_MAX_LEN>> &control_endpoints_out,
+        std::unordered_map<size_t, std::tuple<uint64_t, uint64_t, size_t>> &notif_buffers_out) const;
 
 private:
     size_t striping_threshold_;

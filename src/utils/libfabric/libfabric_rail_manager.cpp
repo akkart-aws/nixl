@@ -787,11 +787,46 @@ nixlLibfabricRailManager::serializeConnectionInfo(const std::string &user_prefix
     std::string data_prefix = user_prefix + "_data_ep_";
     std::string control_prefix = user_prefix + "_control_ep_";
 
+    // Serialize rail endpoints
     serializeRailEndpoints(ser_des, data_prefix, RailType::DATA);
     serializeRailEndpoints(ser_des, control_prefix, RailType::CONTROL);
+    
+    // Serialize notification buffer metadata for each data rail
+    for (size_t rail_id = 0; rail_id < data_rails_.size(); ++rail_id) {
+        const auto &rail = data_rails_[rail_id];
+        
+        // Get buffer pool metadata
+        const auto &addrs = rail->getNotificationBufferAddrs();
+        const auto &keys = rail->getNotificationBufferKeys();
+        size_t num_buffers = rail->getNumNotificationBuffers();
+        size_t buffer_size = rail->getNotificationBufferSize();
+        
+        // Serialize number of buffers
+        std::string num_buffers_key = user_prefix + "_notif_num_buffers_" + std::to_string(rail_id);
+        ser_des.addBuf(num_buffers_key.c_str(), &num_buffers, sizeof(num_buffers));
+        
+        // Serialize buffer size
+        std::string size_key = user_prefix + "_notif_buf_size_" + std::to_string(rail_id);
+        ser_des.addBuf(size_key.c_str(), &buffer_size, sizeof(buffer_size));
+        
+        // Serialize ALL buffer addresses (each buffer has its own address)
+        std::string addrs_key = user_prefix + "_notif_addrs_" + std::to_string(rail_id);
+        ser_des.addBuf(addrs_key.c_str(), addrs.data(), addrs.size() * sizeof(uint64_t));
+        
+        // Serialize ALL buffer keys (each buffer has its own MR key)
+        std::string keys_key = user_prefix + "_notif_keys_" + std::to_string(rail_id);
+        ser_des.addBuf(keys_key.c_str(), keys.data(), keys.size() * sizeof(uint64_t));
+        
+        NIXL_DEBUG << "Serialized notification buffer pool for rail " << rail_id
+                   << " num_buffers=" << num_buffers
+                   << " buffer_size=" << buffer_size
+                   << " addrs_size=" << addrs.size()
+                   << " keys_size=" << keys.size();
+    }
+    
     str = ser_des.exportStr();
     NIXL_DEBUG << "Connection info serialized with prefix " << user_prefix
-               << ", size=" << str.length();
+               << ", size=" << str.length() << " (includes " << data_rails_.size() << " notification buffers)";
     return NIXL_SUCCESS;
 }
 
@@ -800,7 +835,8 @@ nixlLibfabricRailManager::deserializeConnectionInfo(
     const std::string &user_prefix,
     const std::string &serialized_data,
     std::vector<std::array<char, LF_EP_NAME_MAX_LEN>> &data_endpoints_out,
-    std::vector<std::array<char, LF_EP_NAME_MAX_LEN>> &control_endpoints_out) const {
+    std::vector<std::array<char, LF_EP_NAME_MAX_LEN>> &control_endpoints_out,
+    std::unordered_map<size_t, std::tuple<uint64_t, uint64_t, size_t>> &notif_buffers_out) const {
 
     nixlSerDes ser_des;
     ser_des.importStr(serialized_data);
@@ -808,6 +844,8 @@ nixlLibfabricRailManager::deserializeConnectionInfo(
     // Use user prefix with standard suffixes
     std::string data_prefix = user_prefix + "_data_ep_";
     std::string control_prefix = user_prefix + "_control_ep_";
+    
+    // Deserialize rail endpoints
     nixl_status_t data_status = deserializeRailEndpoints(ser_des, data_prefix, data_endpoints_out);
     if (data_status != NIXL_SUCCESS) {
         NIXL_ERROR << "Failed to deserialize data rail endpoints with prefix: " << data_prefix;
@@ -821,9 +859,61 @@ nixlLibfabricRailManager::deserializeConnectionInfo(
         return control_status;
     }
 
+    // Deserialize notification buffer metadata for each data rail
+    notif_buffers_out.clear();
+    for (size_t rail_id = 0; rail_id < data_rails_.size(); ++rail_id) {
+        // Deserialize number of buffers
+        std::string num_buffers_key = user_prefix + "_notif_num_buffers_" + std::to_string(rail_id);
+        size_t num_buffers;
+        nixl_status_t status = ser_des.getBuf(num_buffers_key.c_str(), &num_buffers, sizeof(num_buffers));
+        if (status != NIXL_SUCCESS) {
+            NIXL_ERROR << "Failed to get notification buffer count for rail " << rail_id;
+            return status;
+        }
+        
+        // Deserialize buffer size
+        std::string size_key = user_prefix + "_notif_buf_size_" + std::to_string(rail_id);
+        size_t buffer_size;
+        status = ser_des.getBuf(size_key.c_str(), &buffer_size, sizeof(buffer_size));
+        if (status != NIXL_SUCCESS) {
+            NIXL_ERROR << "Failed to get notification buffer size for rail " << rail_id;
+            return status;
+        }
+        
+        // Deserialize ALL buffer addresses
+        std::string addrs_key = user_prefix + "_notif_addrs_" + std::to_string(rail_id);
+        std::vector<uint64_t> addrs(num_buffers);
+        status = ser_des.getBuf(addrs_key.c_str(), addrs.data(), num_buffers * sizeof(uint64_t));
+        if (status != NIXL_SUCCESS) {
+            NIXL_ERROR << "Failed to get notification buffer addresses for rail " << rail_id;
+            return status;
+        }
+        
+        // Deserialize ALL buffer keys
+        std::string keys_key = user_prefix + "_notif_keys_" + std::to_string(rail_id);
+        std::vector<uint64_t> keys(num_buffers);
+        status = ser_des.getBuf(keys_key.c_str(), keys.data(), num_buffers * sizeof(uint64_t));
+        if (status != NIXL_SUCCESS) {
+            NIXL_ERROR << "Failed to get notification buffer keys for rail " << rail_id;
+            return status;
+        }
+        
+        // Store vectors of addresses and keys (tuple format: addrs, keys, num_buffers)
+        notif_buffers_out[rail_id] = std::make_tuple(
+            reinterpret_cast<uint64_t>(new std::vector<uint64_t>(addrs)),
+            reinterpret_cast<uint64_t>(new std::vector<uint64_t>(keys)),
+            num_buffers);
+        
+        NIXL_DEBUG << "Deserialized notification buffer pool for rail " << rail_id
+                   << " num_buffers=" << num_buffers
+                   << " buffer_size=" << buffer_size
+                   << " addrs_size=" << addrs.size()
+                   << " keys_size=" << keys.size();
+    }
+
     NIXL_DEBUG << "Connection info deserialized with prefix " << user_prefix << ": "
                << data_endpoints_out.size() << " data endpoints, " << control_endpoints_out.size()
-               << " control endpoints";
+               << " control endpoints, " << notif_buffers_out.size() << " notification buffers";
     return NIXL_SUCCESS;
 }
 
@@ -947,3 +1037,4 @@ nixlLibfabricRailManager::getActiveRailCount() const {
     std::lock_guard<std::mutex> lock(active_rails_mutex_);
     return active_rails_.size();
 }
+

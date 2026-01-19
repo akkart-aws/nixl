@@ -195,6 +195,9 @@ nixlLibfabricBackendH::nixlLibfabricBackendH(nixl_xfer_op_t op, const std::strin
 
 nixlLibfabricBackendH::~nixlLibfabricBackendH() {
     NIXL_DEBUG << "handle destructor called, address: " << this;
+    
+    // No cleanup needed for notification buffers - they are owned by the rail
+    // and will be cleaned up when the rail is destroyed
 }
 
 // Multi-request completion tracking methods
@@ -451,6 +454,7 @@ nixlLibfabricEngine::getConnInfo(std::string &str) const {
                << " rails";
 
     // Use Rail Manager's connection SerDes method with "dest" prefix for remote consumption
+    // This now includes notification buffer metadata
     nixl_status_t status = rail_manager.serializeConnectionInfo("dest", str);
     if (status != NIXL_SUCCESS) {
         NIXL_ERROR << "Rail Manager serializeConnectionInfo failed";
@@ -482,21 +486,31 @@ nixlLibfabricEngine::loadRemoteConnInfo(const std::string &remote_agent,
                << rail_manager.getNumControlRails() << " control rails for agent: " << remote_agent;
 
     // Use Rail Manager's connection SerDes method with "dest" prefix (remote is sending us their
-    // endpoints as "dest")
+    // endpoints as "dest") - this now includes notification buffer metadata
     std::vector<std::array<char, LF_EP_NAME_MAX_LEN>> data_endpoints;
     std::vector<std::array<char, LF_EP_NAME_MAX_LEN>> control_endpoints;
+    std::unordered_map<size_t, std::tuple<uint64_t, uint64_t, size_t>> notif_buffers;
+    
     nixl_status_t status = rail_manager.deserializeConnectionInfo(
-        "dest", remote_conn_info, data_endpoints, control_endpoints);
+        "dest", remote_conn_info, data_endpoints, control_endpoints, notif_buffers);
     if (status != NIXL_SUCCESS) {
         NIXL_ERROR << "Rail Manager deserializeConnectionInfo failed";
         return status;
     }
+    
     // Create connection to remote agent
     nixl_status_t conn_status =
         createAgentConnection(remote_agent, data_endpoints, control_endpoints);
     if (conn_status != NIXL_SUCCESS) {
         NIXL_ERROR << "createAgentConnection failed with status: " << conn_status;
         return conn_status;
+    }
+
+    // Store notification buffer metadata in the connection
+    auto conn_it = connections_.find(remote_agent);
+    if (conn_it != connections_.end()) {
+        conn_it->second->rail_notif_buffer_info_ = notif_buffers;
+        NIXL_DEBUG << "Stored notification buffer metadata for " << notif_buffers.size() << " rails";
     }
 
     NIXL_DEBUG << "Successfully stored multirail connection for " << remote_agent << " on "
@@ -993,6 +1007,34 @@ nixlLibfabricEngine::prepXfer(const nixl_xfer_op_t &operation,
         NIXL_DEBUG << "prepXfer: Fragmented notification into "
                    << backend_handle->binary_notifs.size()
                    << " fragments, total_length=" << backend_handle->total_notif_msg_len;
+        
+        // Pre-serialize notification data to ALL rail sender buffers (memcpy only, no malloc/register)
+        // The rail already has 1024 pre-allocated and pre-registered sender buffers
+        // In notifSendPriv, we select buffer using: sender_buffer_idx = xfer_id % 1024
+        // and only update the header fields (notif_xfer_id, expected_completions)
+        const size_t data_rail_id = 0;
+        const size_t num_sender_buffers = NIXL_LIBFABRIC_NUM_NOTIF_BUFFERS; // 1024
+        
+        NIXL_DEBUG << "prepXfer: Pre-serializing notification to " << num_sender_buffers
+                   << " rail sender buffers (memcpy only, buffers already registered)";
+        
+        // Pre-serialize the FIRST fragment to ALL rail sender buffers
+        // (notif_xfer_id and expected_completions will be updated in notifSendPriv)
+        if (backend_handle->binary_notifs.size() > 0) {
+            for (size_t buf_idx = 0; buf_idx < num_sender_buffers; ++buf_idx) {
+                void* rail_buffer = rail_manager.getDataRail(data_rail_id).getSenderNotifBuffer(buf_idx);
+                if (!rail_buffer) {
+                    NIXL_ERROR << "Failed to get rail sender notification buffer " << buf_idx;
+                    delete backend_handle;
+                    return NIXL_ERR_BACKEND;
+                }
+                // Serialize notification to rail's pre-allocated buffer
+                backend_handle->binary_notifs[0].serialize(rail_buffer);
+            }
+        }
+        
+        NIXL_DEBUG << "prepXfer: Pre-serialized notification to " << num_sender_buffers
+                   << " rail sender buffers (NO malloc, NO fi_mr_reg - using rail's pre-registered buffers)";
     }
 
     handle = backend_handle; // Assign to base class pointer
@@ -1145,7 +1187,8 @@ nixlLibfabricEngine::postXfer(const nixl_xfer_op_t &operation,
                                                    backend_handle->binary_notifs,
                                                    backend_handle->total_notif_msg_len,
                                                    backend_handle->post_xfer_id,
-                                                   backend_handle->get_submitted_requests_count());
+                                                   backend_handle->get_submitted_requests_count(),
+                                                   backend_handle);
         if (notif_status != NIXL_SUCCESS) {
             NIXL_ERROR << "Failed to send notification";
             return notif_status;
@@ -1169,7 +1212,8 @@ nixlLibfabricEngine::postXfer(const nixl_xfer_op_t &operation,
                                                        backend_handle->binary_notifs,
                                                        backend_handle->total_notif_msg_len,
                                                        backend_handle->post_xfer_id,
-                                                       0);
+                                                       0,
+                                                       backend_handle);
             if (notif_status != NIXL_SUCCESS) {
                 NIXL_ERROR << "Failed to send notification";
                 return notif_status;
@@ -1200,7 +1244,8 @@ nixlLibfabricEngine::checkXfer(nixlBackendReqH *handle) const {
                                                        backend_handle->binary_notifs,
                                                        backend_handle->total_notif_msg_len,
                                                        backend_handle->post_xfer_id,
-                                                       0);
+                                                       0,
+                                                       backend_handle);
             if (notif_status != NIXL_SUCCESS) {
                 NIXL_ERROR << "Failed to send notification";
                 return notif_status;
@@ -1315,12 +1360,14 @@ nixlLibfabricEngine::fragmentNotificationMessage(
 }
 
 // notifSendPriv that accepts vector of BinaryNotifications for fragmentation support
+// NOW USES fi_writedata instead of fi_senddata with pre-allocated buffers
 nixl_status_t
 nixlLibfabricEngine::notifSendPriv(const std::string &remote_agent,
                                    std::vector<BinaryNotification> &binary_notifications,
                                    uint32_t total_message_length,
                                    uint16_t notif_xfer_id,
-                                   uint32_t expected_completions) const {
+                                   uint32_t expected_completions,
+                                   nixlLibfabricBackendH *handle) const {
     auto it = connections_.find(remote_agent);
     if (it == connections_.end()) {
         NIXL_ERROR << "No connection found for agent: " << remote_agent;
@@ -1330,62 +1377,178 @@ nixlLibfabricEngine::notifSendPriv(const std::string &remote_agent,
     auto connection = it->second;
     const size_t data_rail_id = 0; // Use data rail 0 for notifications
 
-    NIXL_DEBUG << "Sending " << binary_notifications.size() << " notification fragments"
-               << " total_message_length=" << total_message_length;
+    NIXL_DEBUG << "Sending " << binary_notifications.size() << " notification fragments via writedata"
+               << " total_message_length=" << total_message_length
+               << " using " << (handle ? "pre-allocated" : "on-demand") << " buffers";
 
-    // Send each notification fragment
+    // Get remote notification buffer info for this rail
+    auto notif_buf_it = connection->rail_notif_buffer_info_.find(data_rail_id);
+    if (notif_buf_it == connection->rail_notif_buffer_info_.end()) {
+        NIXL_ERROR << "No notification buffer info for rail " << data_rail_id;
+        return NIXL_ERR_NOT_FOUND;
+    }
+    
+    // Extract buffer pool metadata from tuple: (addrs_ptr, keys_ptr, num_buffers)
+    auto *remote_addrs = reinterpret_cast<std::vector<uint64_t>*>(std::get<0>(notif_buf_it->second));
+    auto *remote_keys = reinterpret_cast<std::vector<uint64_t>*>(std::get<1>(notif_buf_it->second));
+    size_t num_notif_buffers = std::get<2>(notif_buf_it->second);
+    
+    // Calculate buffer index using xfer_id modulo number of buffers
+    // This ensures each notification uses a different buffer to prevent overwrites
+    size_t buffer_idx = notif_xfer_id % num_notif_buffers;
+    
+    // Get the specific address and key for this buffer
+    uint64_t remote_notif_addr = (*remote_addrs)[buffer_idx];
+    uint64_t remote_notif_key = (*remote_keys)[buffer_idx];
+    
+    NIXL_INFO << "NOTIF_SEND: Using buffer_idx=" << buffer_idx << " for notif_xfer_id=" << notif_xfer_id
+              << " (xfer_id % " << num_notif_buffers << ")"
+              << " remote_addr=" << std::hex << remote_notif_addr << std::dec
+              << " remote_key=" << remote_notif_key
+              << " num_fragments=" << binary_notifications.size();
+
+    // Send each notification fragment via writedata
+    // For single-fragment notifications, write directly to the selected buffer
+    // For multi-fragment notifications, each fragment still goes to the same buffer
+    // (fragments are reassembled on receiver side)
     for (size_t seq_id = 0; seq_id < binary_notifications.size(); ++seq_id) {
         auto &binary_notification = binary_notifications[seq_id];
 
-        // Update header fields for this notification
+        // Update header fields
         BinaryNotificationHeader header = binary_notification.getHeader();
         header.notif_xfer_id = notif_xfer_id;
+        header.notif_seq_id = seq_id;
         binary_notification.setHeader(header);
 
-        // Update first fragment header with expected_completions (only for fragment 0)
-        // Note: agent_name_length was already set during fragmentation
+        // Update metadata for first fragment
         if (seq_id == 0) {
             const BinaryNotificationMetadata &metadata = binary_notification.getMetadata();
             binary_notification.setMetadata(
                 total_message_length, expected_completions, metadata.agent_name_length);
         }
 
-        // Allocate control request for this notification fragment from data rail
-        size_t max_size = BinaryNotification::MAX_FRAGMENT_SIZE;
-        nixlLibfabricReq *control_request = rail_manager.getDataRail(data_rail_id)
-                                                .allocateControlRequest(max_size, notif_xfer_id);
+        // Get buffer and MR - use rail's sender buffer pool if handle provided, otherwise allocate on-demand
+        void *local_buffer;
+        size_t serialized_size;
+        struct fid_mr *local_mr;
+        bool need_cleanup = false;
+        
+        if (handle) {
+            // Use rail's sender buffer pool (postXfer case)
+            // Calculate sender buffer index using same scheme as receiver: xfer_id % 1024
+            size_t sender_buffer_idx = notif_xfer_id % NIXL_LIBFABRIC_NUM_NOTIF_BUFFERS;
+            
+            local_buffer = rail_manager.getDataRail(data_rail_id).getSenderNotifBuffer(sender_buffer_idx);
+            local_mr = rail_manager.getDataRail(data_rail_id).getSenderNotifMR(sender_buffer_idx);
+            
+            if (!local_buffer || !local_mr) {
+                NIXL_ERROR << "Failed to get rail sender buffer/MR for index " << sender_buffer_idx;
+                return NIXL_ERR_BACKEND;
+            }
+            
+            // Re-serialize the updated notification to the selected rail buffer
+            // This updates notif_xfer_id and expected_completions in the buffer
+            serialized_size = binary_notification.serialize(local_buffer);
+            
+            NIXL_INFO << "NOTIF_SEND: Using rail sender buffer[" << sender_buffer_idx
+                      << "] for fragment " << seq_id
+                      << " xfer_id=" << notif_xfer_id
+                      << " addr=" << std::hex << (uint64_t)local_buffer << std::dec
+                      << " (xfer_id % " << NIXL_LIBFABRIC_NUM_NOTIF_BUFFERS << ")";
+        } else {
+            // Fallback: allocate and register on-demand (for genNotif case or if pool not initialized)
+            size_t max_size = BinaryNotification::MAX_FRAGMENT_SIZE;
+            local_buffer = malloc(max_size);
+            if (!local_buffer) {
+                NIXL_ERROR << "Failed to allocate local buffer for notification fragment " << seq_id;
+                return NIXL_ERR_BACKEND;
+            }
+            
+            serialized_size = binary_notification.serialize(local_buffer);
+            
+            // Register buffer with libfabric using rail's registerMemory method
+            uint64_t notif_key;
+            nixl_status_t reg_status = rail_manager.getDataRail(data_rail_id).registerMemory(
+                local_buffer,
+                serialized_size,
+                DRAM_SEG,  // Notification buffers are in DRAM
+                -1,  // No GPU ID for DRAM
+                &local_mr,
+                &notif_key);
+            
+            if (reg_status != NIXL_SUCCESS) {
+                NIXL_ERROR << "Failed to register notification buffer for genNotif";
+                free(local_buffer);
+                return NIXL_ERR_BACKEND;
+            }
+            need_cleanup = true;
+            
+            NIXL_INFO << "NOTIF_SEND: Allocated on-demand buffer for fragment " << seq_id
+                      << " xfer_id=" << notif_xfer_id << " addr=" << std::hex << (uint64_t)local_buffer << std::dec;
+        }
 
-        if (!control_request) {
-            NIXL_ERROR << "Failed to allocate control request for notification fragment " << seq_id;
+        NIXL_DEBUG << "Sending notification fragment " << seq_id << "/" << binary_notifications.size()
+                   << " size=" << serialized_size << "B"
+                   << " xfer_id=" << notif_xfer_id
+                   << " to remote buffer addr=" << std::hex << remote_notif_addr << std::dec
+                   << " key=" << remote_notif_key;
+
+        // Allocate data request for writedata operation
+        nixlLibfabricReq *req = rail_manager.getDataRail(data_rail_id)
+                                    .allocateDataRequest(nixlLibfabricReq::WRITE, notif_xfer_id);
+        if (!req) {
+            NIXL_ERROR << "Failed to allocate data request for notification fragment " << seq_id;
+            if (need_cleanup) {
+                fi_close(&local_mr->fid);
+                free(local_buffer);
+            }
             return NIXL_ERR_BACKEND;
         }
 
-        // Serialize BinaryNotification to control request buffer
-        size_t serialized_size = binary_notification.serialize(control_request->buffer);
-        control_request->buffer_size = serialized_size;
+        // Setup write parameters - write to the selected buffer
+        req->local_addr = local_buffer;
+        req->chunk_size = serialized_size;
+        req->remote_addr = remote_notif_addr;  // Use the specific buffer's address
+        req->local_mr = local_mr;
+        req->remote_key = remote_notif_key;  // Use the specific buffer's key
+        req->dest_addr = connection->rail_remote_addr_list_[data_rail_id][0];
+        req->immediate_data = NIXL_MAKE_IMM_DATA(
+            NIXL_LIBFABRIC_MSG_NOTIFICTION, connection->agent_index_, notif_xfer_id, seq_id);
+        
+        // Set cleanup callback only if we allocated on-demand (genNotif case)
+        if (need_cleanup) {
+            req->completion_callback = [local_buffer, local_mr]() {
+                fi_close(&local_mr->fid);
+                free(local_buffer);
+            };
+        }
+        // For pre-allocated buffers, no cleanup needed - they're cleaned up in handle destructor
 
-        NIXL_DEBUG << "Sending binary notification fragment " << seq_id << "/"
-                   << binary_notifications.size() << " size=" << serialized_size << "B"
-                   << " payload_chunk_size=" << header.payload_length << "B"
-                   << " notif_xfer_id=" << header.notif_xfer_id;
-
-        nixl_status_t status = rail_manager.postControlRequest(
-            nixlLibfabricRailManager::ControlMessageType::NOTIFICATION,
-            control_request,
-            connection->rail_remote_addr_list_[data_rail_id][0],
-            connection->agent_index_,
-            nullptr,
-            nixlLibfabricRailManager::RailSelection::DATA_RAIL);
-
+        // Post writedata
+        NIXL_INFO << "NOTIF_SEND: Calling postWrite for fragment " << seq_id
+                  << " xfer_id=" << notif_xfer_id
+                  << " buffer_idx=" << buffer_idx
+                  << " local_addr=" << std::hex << (uint64_t)local_buffer << std::dec
+                  << " remote_addr=" << std::hex << remote_notif_addr << std::dec
+                  << " remote_key=" << remote_notif_key
+                  << " size=" << serialized_size;
+        
+        nixl_status_t status = rail_manager.getDataRail(data_rail_id).postWrite(req);
         if (status != NIXL_SUCCESS) {
-            NIXL_ERROR << "postControlRequest failed on data rail " << data_rail_id
-                       << " for fragment " << seq_id;
-            return NIXL_ERR_BACKEND;
+            NIXL_ERROR << "NOTIF_SEND: postWrite FAILED for fragment " << seq_id;
+            if (need_cleanup) {
+                fi_close(&local_mr->fid);
+                free(local_buffer);
+            }
+            rail_manager.getDataRail(data_rail_id).releaseRequest(req);
+            return status;
         }
+        
+        NIXL_INFO << "NOTIF_SEND: postWrite SUCCEEDED for fragment " << seq_id << " xfer_id=" << notif_xfer_id;
     }
 
-    NIXL_DEBUG << "Successfully sent all " << binary_notifications.size()
-               << " notification fragments" << " total_length=" << total_message_length;
+    NIXL_DEBUG << "Successfully submitted all " << binary_notifications.size()
+               << " notification fragments via writedata";
     return NIXL_SUCCESS;
 }
 
@@ -1399,7 +1562,7 @@ nixlLibfabricEngine::genNotif(const std::string &remote_agent, const std::string
     NIXL_DEBUG << "genNotif: Fragmented notification into " << notifications.size()
                << " fragments, total_length=" << total_msg_len;
 
-    return notifSendPriv(remote_agent, notifications, total_msg_len, 0, 0);
+    return notifSendPriv(remote_agent, notifications, total_msg_len, 0, 0, nullptr);
 }
 
 nixl_status_t
@@ -1536,7 +1699,7 @@ nixlLibfabricEngine::postShutdownCompletion() {
 
 void
 nixlLibfabricEngine::processNotification(const std::string &serialized_notif) {
-    NIXL_DEBUG << "Received notification size=" << serialized_notif.size();
+    NIXL_INFO << "NOTIF_RECV: Received notification size=" << serialized_notif.size();
 
     // Deserialize binary notification
     BinaryNotification binary_notif;
@@ -1547,6 +1710,9 @@ nixlLibfabricEngine::processNotification(const std::string &serialized_notif) {
     uint16_t notif_xfer_id = header.notif_xfer_id;
     uint16_t notif_seq_id = header.notif_seq_id;
     uint16_t notif_seq_len = header.notif_seq_len;
+    
+    NIXL_INFO << "NOTIF_RECV: xfer_id=" << notif_xfer_id
+              << " seq=" << notif_seq_id << "/" << notif_seq_len;
 
     // Get payload chunk (combined agent_name + message chunk for all fragments)
     const std::string &payload_chunk = binary_notif.getPayload();
@@ -1641,11 +1807,13 @@ nixlLibfabricEngine::processConnectionRequest(uint16_t agent_idx,
                << rail->rail_id;
 
     // Use rail manager to deserialize ALL endpoints at once with "src" prefix (connection request
-    // contains source endpoints)
+    // contains source endpoints) - notification buffers not included in connection requests
     std::vector<std::array<char, LF_EP_NAME_MAX_LEN>> data_endpoints;
     std::vector<std::array<char, LF_EP_NAME_MAX_LEN>> control_endpoints;
+    std::unordered_map<size_t, std::tuple<uint64_t, uint64_t, size_t>> notif_buffers;
+    
     nixl_status_t status = rail_manager.deserializeConnectionInfo(
-        "src", serialized_data, data_endpoints, control_endpoints);
+        "src", serialized_data, data_endpoints, control_endpoints, notif_buffers);
     if (status != NIXL_SUCCESS) {
         NIXL_ERROR << "Failed to deserialize connection info";
         return status;
@@ -1732,13 +1900,13 @@ nixlLibfabricEngine::addReceivedXferId(uint16_t xfer_id) {
             it->second.received_completions = 0;
             it->second.expected_msg_fragments = 1; // Default to 1 fragment
             it->second.received_msg_fragments = 0;
-            NIXL_DEBUG << "Created placeholder notification for notif_xfer_id " << xfer_id
-                       << " (write arrived first)";
+            NIXL_INFO << "WRITE_COMPLETE: Created placeholder for xfer_id=" << xfer_id
+                      << " (write arrived first)";
         }
 
         it->second.received_completions++;
-        NIXL_DEBUG << "Incremented received count for notif_xfer_id " << xfer_id << ": "
-                   << it->second.received_completions << "/" << it->second.expected_completions;
+        NIXL_INFO << "WRITE_COMPLETE: xfer_id=" << xfer_id << " completions="
+                  << it->second.received_completions << "/" << it->second.expected_completions;
     }
 
     // Check if any notifications can now be completed (after releasing the lock)
@@ -1760,10 +1928,11 @@ nixlLibfabricEngine::checkPendingNotifications() {
         bool writes_complete = (it->second.received_completions >= it->second.expected_completions);
 
         if (fragments_complete && writes_complete) {
-            NIXL_TRACE << "Notification complete: fragments=" << it->second.received_msg_fragments
-                       << "/" << it->second.expected_msg_fragments
-                       << " writes=" << it->second.received_completions << "/"
-                       << it->second.expected_completions;
+            NIXL_INFO << "NOTIF_COMPLETE: xfer_id=" << it->first
+                      << " fragments=" << it->second.received_msg_fragments
+                      << "/" << it->second.expected_msg_fragments
+                      << " writes=" << it->second.received_completions << "/"
+                      << it->second.expected_completions;
 
             // Reassemble combined payload from fragments
             std::string combined_payload;
