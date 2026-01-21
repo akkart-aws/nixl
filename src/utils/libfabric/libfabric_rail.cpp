@@ -57,7 +57,7 @@ RequestPool::release(nixlLibfabricReq *req) const {
         return;
     }
 
-    std::lock_guard<std::mutex> lock(pool_mutex_);
+    // Single-threaded access - no mutex needed
 
     // GUARD: Check if already released
     if (!req->in_use) {
@@ -91,7 +91,7 @@ RequestPool::release(nixlLibfabricReq *req) const {
 
 nixlLibfabricReq *
 RequestPool::findByContext(void *context) const {
-    std::lock_guard<std::mutex> lock(pool_mutex_);
+    // Single-threaded access - no mutex needed
 
     if (!context) {
         return nullptr;
@@ -107,19 +107,19 @@ RequestPool::findByContext(void *context) const {
 
 size_t
 RequestPool::getActiveRequestCount() const {
-    std::lock_guard<std::mutex> lock(pool_mutex_);
+    // Single-threaded access - no mutex needed
     return requests_.size() - free_indices_.size();
 }
 
 size_t
 RequestPool::getPoolUtilization() const {
-    std::lock_guard<std::mutex> lock(pool_mutex_);
+    // Single-threaded access - no mutex needed
     return ((requests_.size() - free_indices_.size()) * 100) / requests_.size();
 }
 
 nixlLibfabricReq *
 RequestPool::allocateReq(uint32_t req_id) {
-    std::lock_guard<std::mutex> lock(pool_mutex_);
+    // Single-threaded access - no mutex needed
 
     if (free_indices_.empty()) {
         size_t old_size = requests_.size();
@@ -389,8 +389,6 @@ nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
     : rail_id(id),
       device_name(device),
       provider_name(provider),
-      blocking_cq_sread_supported(true),
-      progress_thread_enabled_(progress_thread_enabled),
       control_request_pool_(NIXL_LIBFABRIC_CONTROL_REQUESTS_PER_RAIL, id),
       data_request_pool_(NIXL_LIBFABRIC_DATA_REQUESTS_PER_RAIL, id),
       provider_supports_hmem_(false) {
@@ -472,34 +470,15 @@ nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
             throw std::runtime_error("fi_domain failed for rail " + std::to_string(rail_id));
         }
 
-        // Create CQ for this rail
+        // Create CQ for this rail (always non-blocking)
         struct fi_cq_attr cq_attr = {};
         cq_attr.format = FI_CQ_FORMAT_DATA;
-        cq_attr.wait_obj = FI_WAIT_UNSPEC;
+        cq_attr.wait_obj = FI_WAIT_NONE; // Always non-blocking
         cq_attr.size = 12288;
         ret = fi_cq_open(domain, &cq_attr, &cq, NULL);
         if (ret) {
-            NIXL_INFO << "not harmful: fi_cq_open with FI_WAIT_UNSPEC failed for rail " << rail_id
-                      << ": " << fi_strerror(-ret) << " - trying FI_WAIT_NONE for "
-                      << info->fabric_attr->name << " provider";
-            if (ret == -FI_ENOSYS) {
-                NIXL_TRACE << "FI_WAIT_UNSPEC not supported, falling back to FI_WAIT_NONE for rail "
-                           << rail_id;
-                blocking_cq_sread_supported = false;
-                // If fi_cq_open fails due to FI_WAIT_UNSPEC not supported, we fall back to
-                // FI_WAIT_NONE and use fi_cq_read in control rails
-                cq_attr.wait_obj = FI_WAIT_NONE;
-                ret = fi_cq_open(domain, &cq_attr, &cq, NULL);
-                if (ret) {
-                    NIXL_ERROR << "fi_cq_open with FI_WAIT_NONE failed for rail " << rail_id << ": "
-                               << fi_strerror(-ret);
-                    throw std::runtime_error("fi_cq_open with FI_WAIT_NONE failed for rail " +
-                                             std::to_string(rail_id));
-                }
-                NIXL_TRACE << "fi_cq_open with FI_WAIT_NONE succeeded for rail " << rail_id;
-            } else {
-                throw std::runtime_error("fi_cq_open failed for rail " + std::to_string(rail_id));
-            }
+            NIXL_ERROR << "fi_cq_open failed for rail " << rail_id << ": " << fi_strerror(-ret);
+            throw std::runtime_error("fi_cq_open failed for rail " + std::to_string(rail_id));
         }
         // Verify CQ was properly created
         if (!cq) {
@@ -731,50 +710,37 @@ nixlLibfabricRail::setXferIdCallback(std::function<void(uint32_t)> callback) {
 
 // Per-Rail Completion Processing
 
-// Per-rail completion processing - handles one rail's CQ with configurable blocking behavior
+// Per-rail completion processing - handles one rail's CQ (always non-blocking)
 // Optimized to batch read up to NIXL_LIBFABRIC_CQ_BATCH_SIZE completions per syscall
 nixl_status_t
-nixlLibfabricRail::progressCompletionQueue(bool use_blocking) const {
-    // Batch completion processing - read up to 16 completions per syscall
+nixlLibfabricRail::progressCompletionQueue() const {
+    // Batch completion processing - read up to 64 completions per syscall
     struct fi_cq_data_entry completions[NIXL_LIBFABRIC_CQ_BATCH_SIZE];
     memset(completions, 0, sizeof(completions));
 
     ssize_t ret;
 
-    // Only protect libfabric CQ hardware operations
-    {
-        std::lock_guard<std::mutex> cq_lock(cq_rail_mutex_);
+    // Always use non-blocking batch read (single-threaded, no mutex needed)
+    ret = fi_cq_read(cq, completions, NIXL_LIBFABRIC_CQ_BATCH_SIZE);
 
-        if (use_blocking && blocking_cq_sread_supported) {
-            // Blocking read using fi_cq_sread (used by CM thread)
-            // Keep single-entry semantics for blocking to preserve timeout behavior
-            ret = fi_cq_sread(cq, completions, 1, nullptr, NIXL_LIBFABRIC_CQ_SREAD_TIMEOUT_MS);
+    if (ret < 0 && ret != -FI_EAGAIN) {
+        NIXL_ERROR << "fi_cq_read returned error " << ret << " on rail " << rail_id << ": "
+                   << fi_strerror(-ret);
+
+        // Handle error - but be careful about fi_cq_readerr
+        struct fi_cq_err_entry err_entry;
+        memset(&err_entry, 0, sizeof(err_entry));
+
+        int err_ret = fi_cq_readerr(cq, &err_entry, 0);
+        if (err_ret > 0) {
+            NIXL_ERROR << "CQ read failed on rail " << rail_id
+                       << " with error: " << fi_strerror(err_entry.err)
+                       << " prov_errno: " << err_entry.prov_errno << " len: " << err_entry.len;
         } else {
-            // Non-blocking batch read (used by progress thread)
-            // Read up to NIXL_LIBFABRIC_CQ_BATCH_SIZE completions per syscall
-            ret = fi_cq_read(cq, completions, NIXL_LIBFABRIC_CQ_BATCH_SIZE);
+            NIXL_ERROR << "fi_cq_readerr failed with " << err_ret;
         }
-
-        if (ret < 0 && ret != -FI_EAGAIN) {
-            NIXL_ERROR << "fi_cq_read returned error " << ret << " on rail " << rail_id << ": "
-                       << fi_strerror(-ret);
-
-            // Handle error - but be careful about fi_cq_readerr
-            struct fi_cq_err_entry err_entry;
-            memset(&err_entry, 0, sizeof(err_entry));
-
-            int err_ret = fi_cq_readerr(cq, &err_entry, 0);
-            if (err_ret > 0) {
-                NIXL_ERROR << "CQ read failed on rail " << rail_id
-                           << " with error: " << fi_strerror(err_entry.err)
-                           << " prov_errno: " << err_entry.prov_errno << " len: " << err_entry.len;
-            } else {
-                NIXL_ERROR << "fi_cq_readerr failed with " << err_ret;
-            }
-            return NIXL_ERR_BACKEND;
-        }
+        return NIXL_ERR_BACKEND;
     }
-    // CQ lock released here - completions are now local data
 
     if (ret == -FI_EAGAIN) {
         return NIXL_IN_PROG; // No completions available
@@ -1111,17 +1077,14 @@ nixlLibfabricRail::postSend(nixlLibfabricReq *req) const {
     int attempt = 0;
 
     while (true) {
-        // Protect fi_senddata call with endpoint submission mutex
-        {
-            std::lock_guard<std::mutex> submit_lock(cq_rail_mutex_);
-            ret = fi_senddata(endpoint,
-                              req->buffer,
-                              req->buffer_size,
-                              desc,
-                              req->immediate_data,
-                              req->dest_addr,
-                              &req->ctx);
-        }
+        // Single-threaded access - no mutex needed
+        ret = fi_senddata(endpoint,
+                          req->buffer,
+                          req->buffer_size,
+                          desc,
+                          req->immediate_data,
+                          req->dest_addr,
+                          &req->ctx);
 
         if (ret == 0) {
             // Success
@@ -1149,12 +1112,9 @@ nixlLibfabricRail::postSend(nixlLibfabricReq *req) const {
                                     NIXL_LIBFABRIC_MAX_RETRY_DELAY_US);
 
             // Progress completion queue to drain pending completions before retry
-            // Skip if progress thread is enabled to avoid lock contention
-            if (!progress_thread_enabled_) {
-                nixl_status_t progress_status = progressCompletionQueue(false);
-                if (progress_status == NIXL_SUCCESS) {
-                    NIXL_TRACE << "Progressed completions on rail " << rail_id << " before retry";
-                }
+            nixl_status_t progress_status = progressCompletionQueue();
+            if (progress_status == NIXL_SUCCESS) {
+                NIXL_TRACE << "Progressed completions on rail " << rail_id << " before retry";
             }
 
             usleep(delay_us);
@@ -1191,20 +1151,16 @@ nixlLibfabricRail::postWrite(nixlLibfabricReq *req) const {
     int attempt = 0;
 
     while (true) {
-        // Protect fi_writedata call with endpoint submission mutex
-        // Even with FI_THREAD_SAFE, concurrent submissions can cause corruption
-        {
-            std::lock_guard<std::mutex> submit_lock(cq_rail_mutex_);
-            ret = fi_writedata(endpoint,
-                               req->local_addr,
-                               req->chunk_size,
-                               local_desc,
-                               req->immediate_data,
-                               req->dest_addr,
-                               req->remote_addr,
-                               req->remote_key,
-                               &req->ctx);
-        }
+        // Single-threaded access - no mutex needed
+        ret = fi_writedata(endpoint,
+                           req->local_addr,
+                           req->chunk_size,
+                           local_desc,
+                           req->immediate_data,
+                           req->dest_addr,
+                           req->remote_addr,
+                           req->remote_key,
+                           &req->ctx);
 
         if (ret == 0) {
             // Success
@@ -1232,12 +1188,9 @@ nixlLibfabricRail::postWrite(nixlLibfabricReq *req) const {
                                     NIXL_LIBFABRIC_MAX_RETRY_DELAY_US);
 
             // Progress completion queue to drain pending completions before retry
-            // Skip if progress thread is enabled to avoid lock contention
-            if (!progress_thread_enabled_) {
-                nixl_status_t progress_status = progressCompletionQueue(false);
-                if (progress_status == NIXL_SUCCESS) {
-                    NIXL_TRACE << "Progressed completions on rail " << rail_id << " before retry";
-                }
+            nixl_status_t progress_status = progressCompletionQueue();
+            if (progress_status == NIXL_SUCCESS) {
+                NIXL_TRACE << "Progressed completions on rail " << rail_id << " before retry";
             }
 
             usleep(delay_us);
@@ -1273,18 +1226,15 @@ nixlLibfabricRail::postRead(nixlLibfabricReq *req) const {
     int attempt = 0;
 
     while (true) {
-        // Protect fi_read call with endpoint submission mutex
-        {
-            std::lock_guard<std::mutex> submit_lock(cq_rail_mutex_);
-            ret = fi_read(endpoint,
-                          req->local_addr,
-                          req->chunk_size,
-                          local_desc,
-                          req->dest_addr,
-                          req->remote_addr,
-                          req->remote_key,
-                          &req->ctx);
-        }
+        // Single-threaded access - no mutex needed
+        ret = fi_read(endpoint,
+                      req->local_addr,
+                      req->chunk_size,
+                      local_desc,
+                      req->dest_addr,
+                      req->remote_addr,
+                      req->remote_key,
+                      &req->ctx);
 
         if (ret == 0) {
             // Success
@@ -1312,12 +1262,9 @@ nixlLibfabricRail::postRead(nixlLibfabricReq *req) const {
                                     NIXL_LIBFABRIC_MAX_RETRY_DELAY_US);
 
             // Progress completion queue to drain pending completions before retry
-            // Skip if progress thread is enabled to avoid lock contention
-            if (!progress_thread_enabled_) {
-                nixl_status_t progress_status = progressCompletionQueue(false);
-                if (progress_status == NIXL_SUCCESS) {
-                    NIXL_TRACE << "Progressed completions on rail " << rail_id << " before retry";
-                }
+            nixl_status_t progress_status = progressCompletionQueue();
+            if (progress_status == NIXL_SUCCESS) {
+                NIXL_TRACE << "Progressed completions on rail " << rail_id << " before retry";
             }
 
             usleep(delay_us);
@@ -1553,11 +1500,6 @@ nixlLibfabricRail::findRequestFromContext(void *context) const {
     }
     NIXL_ERROR << "No request found for context " << context << " on rail " << rail_id;
     return nullptr;
-}
-
-void
-nixlLibfabricRail::setProgressThreadEnabled(bool enabled) {
-    progress_thread_enabled_ = enabled;
 }
 
 fi_info *

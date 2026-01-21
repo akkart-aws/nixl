@@ -133,7 +133,6 @@ protected:
     mutable std::stack<size_t> free_indices_; ///< Stack of available request indices
     size_t rail_id_; ///< Rail ID for this pool
     size_t initial_pool_size_; ///< Original pool size for expansion calculations
-    mutable std::mutex pool_mutex_; ///< Thread safety protection
 };
 
 /** Buffer chunk structure for control request pool */
@@ -252,9 +251,6 @@ public:
     std::string device_name; ///< EFA device name for this rail
     std::string provider_name; ///< Provider name (e.g., "efa", "efa-direct")
     char ep_name[LF_EP_NAME_MAX_LEN]; ///< Endpoint name for connection setup
-    mutable bool blocking_cq_sread_supported; ///< Whether blocking CQ reads are supported
-    bool
-        progress_thread_enabled_; ///< Whether progress thread is enabled (to skip retry CQ polling)
 
     /** Initialize libfabric rail with all resources */
     nixlLibfabricRail(const std::string &device,
@@ -330,9 +326,9 @@ public:
     nixl_status_t
     postRead(nixlLibfabricReq *req) const;
 
-    /** Process completion queue with batching support */
+    /** Process completion queue with batching support (always non-blocking) */
     nixl_status_t
-    progressCompletionQueue(bool use_blocking = false) const;
+    progressCompletionQueue() const;
 
     // Callback registration methods
     /** Set callback for notification message processing */
@@ -385,9 +381,6 @@ private:
     struct fid_cq *cq; // from rail_cqs[rail_id]
     struct fid_av *av; // from rail_avs[rail_id]
     struct fid_ep *endpoint; ///< Libfabric endpoint handle
-
-    // CQ progress mutex to protect completion queue operations
-    mutable std::mutex cq_rail_mutex_;
 
     // Callback functions
     std::function<void(const std::string &)> notificationCallback;

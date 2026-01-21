@@ -240,13 +240,9 @@ nixlLibfabricBackendH::is_completed() const {
 
 nixlLibfabricEngine::nixlLibfabricEngine(const nixlBackendInitParams *init_params)
     : nixlBackendEngine(init_params),
-      cm_thread_stop_(false),
-      progress_thread_enabled_(init_params->enableProgTh),
-      progress_thread_delay_(std::chrono::microseconds(init_params->pthrDelay)),
-      rail_manager(NIXL_LIBFABRIC_DEFAULT_STRIPING_THRESHOLD, init_params->enableProgTh) {
+      rail_manager(NIXL_LIBFABRIC_DEFAULT_STRIPING_THRESHOLD, false) {
 
-    NIXL_DEBUG << "Initializing Libfabric Backend with GPU Support";
-    progress_thread_delay_ = std::chrono::microseconds(10);
+    NIXL_DEBUG << "Initializing Libfabric Backend with GPU Support (single-threaded mode)";
 
 #ifdef HAVE_CUDA
     // Initialize CUDA context management
@@ -352,31 +348,7 @@ nixlLibfabricEngine::nixlLibfabricEngine(const nixlBackendInitParams *init_param
                    << rail_manager.getNumDataRails() << " data rails and "
                    << rail_manager.getNumControlRails() << " control rails";
 
-        // Threading infrastructure
-        // Start CM thread for background processing
-        NIXL_DEBUG << "Starting CM thread";
-        cm_thread_ = std::thread(&nixlLibfabricEngine::cmThread, this);
-        if (!cm_thread_.joinable()) {
-            NIXL_ERROR << "Failed to start CM thread";
-            throw std::runtime_error("Failed to start CM thread");
-        }
-        NIXL_DEBUG << "ConnectionManagement thread started successfully";
-
-        // Start Progress thread for data rail completion processing
-        if (progress_thread_enabled_) {
-            NIXL_DEBUG << "Starting Progress thread for data rails with delay: "
-                       << progress_thread_delay_.count() << " microseconds";
-            progress_thread_stop_ = false;
-            progress_thread_ = std::thread(&nixlLibfabricEngine::progressThread, this);
-
-            if (!progress_thread_.joinable()) {
-                NIXL_ERROR << "Failed to start Progress thread";
-                throw std::runtime_error("Failed to start Progress thread");
-            }
-            NIXL_DEBUG << "Progress thread started successfully";
-        } else {
-            NIXL_DEBUG << "Progress thread disabled, using manual progress in checkXfer/getNotifs";
-        }
+        NIXL_DEBUG << "Single-threaded mode: all progress handled in checkXfer/getNotifs";
     }
     catch (const std::exception &e) {
         NIXL_ERROR << "Failed to initialize libfabric backend: " << e.what();
@@ -386,32 +358,7 @@ nixlLibfabricEngine::nixlLibfabricEngine(const nixlBackendInitParams *init_param
 }
 
 nixlLibfabricEngine::~nixlLibfabricEngine() {
-    NIXL_DEBUG
-        << "Destructor starting, stopping all threads FIRST to prevent timing report interruption";
-
-    // STOP ALL THREADS FIRST to prevent any interference with timing report
-    cm_thread_stop_.store(true);
-
-    if (progress_thread_enabled_) {
-        progress_thread_stop_.store(true);
-    }
-
-    // Post dummy completion to wake up blocking threads
-    postShutdownCompletion();
-
-    if (cm_thread_.joinable()) {
-        NIXL_DEBUG << "Waiting for CM thread to exit";
-        cm_thread_.join();
-        NIXL_DEBUG << "CM thread joined successfully";
-    }
-    if (progress_thread_enabled_ && progress_thread_.joinable()) {
-        NIXL_DEBUG << "Waiting for Progress thread to exit";
-        progress_thread_.join();
-        NIXL_DEBUG << "Progress thread joined successfully";
-    } else if (!progress_thread_enabled_) {
-        NIXL_DEBUG << "Progress thread was not running";
-    }
-    NIXL_DEBUG << "All threads stopped, now cleaning up resources";
+    NIXL_DEBUG << "Destructor starting cleanup (single-threaded mode)";
     cleanup();
 }
 
@@ -704,23 +651,47 @@ nixlLibfabricEngine::establishConnection(const std::string &remote_agent) const 
         // TODO, wrap req info into a nixlLibfabricRequestHandle and add retry logic
         return NIXL_ERR_BACKEND;
     }
-    // Register the connection state tracker with the CM thread
-    // Wait for the CM thread to establish the connection
+    // Wait for the connection to be established by actively progressing control rails
     // TODO: Currently blocking, update to timeout and return NIXL_IN_PROG
     {
-        std::unique_lock<std::mutex> lock(conn_info->conn_state_mutex_);
         NIXL_DEBUG << "Waiting for connection to be established for agent: " << remote_agent;
-        conn_info->cv_.wait(lock, [conn_info] {
-            return conn_info->overall_state_ == ConnectionState::CONNECTED ||
-                conn_info->overall_state_ == ConnectionState::FAILED;
-        });
-        NIXL_DEBUG << "Connection state for agent " << remote_agent << " is now "
-                   << conn_info->overall_state_;
-
-        if (conn_info->overall_state_ == ConnectionState::FAILED) {
-            NIXL_ERROR << "Connection failed on control rail 0";
+        
+        // Poll control rails until connection is established
+        const int max_attempts = 10000; // Timeout after ~10 seconds
+        int attempts = 0;
+        
+        while (attempts < max_attempts) {
+            // Progress control rails to receive CONNECTION_ACK
+            nixl_status_t progress_status = rail_manager.progressAllControlRails();
+            if (progress_status != NIXL_SUCCESS && progress_status != NIXL_IN_PROG) {
+                NIXL_ERROR << "Failed to progress control rails while waiting for connection";
+                return progress_status;
+            }
+            
+            // Check connection state
+            {
+                std::lock_guard<std::mutex> lock(conn_info->conn_state_mutex_);
+                if (conn_info->overall_state_ == ConnectionState::CONNECTED) {
+                    NIXL_DEBUG << "Connection established for agent " << remote_agent;
+                    break;
+                }
+                if (conn_info->overall_state_ == ConnectionState::FAILED) {
+                    NIXL_ERROR << "Connection failed on control rail 0";
+                    return NIXL_ERR_BACKEND;
+                }
+            }
+            
+            // Small delay to avoid busy-waiting
+            usleep(1000); // 1ms
+            attempts++;
+        }
+        
+        if (attempts >= max_attempts) {
+            NIXL_ERROR << "Connection establishment timeout for agent: " << remote_agent;
             return NIXL_ERR_BACKEND;
         }
+        
+        NIXL_DEBUG << "Connection state for agent " << remote_agent << " is now CONNECTED";
     }
 
     NIXL_DEBUG << "Connection already established for agent: " << remote_agent;
@@ -1136,12 +1107,10 @@ nixlLibfabricEngine::postXfer(const nixl_xfer_op_t &operation,
                    << ", expected_completions: " << backend_handle->get_submitted_requests_count();
     }
 
-    // Progress data rails to kick off transfers
-    if (!progress_thread_enabled_) {
-        nixl_status_t progress_status = rail_manager.progressActiveDataRails();
-        if (progress_status == NIXL_IN_PROG) {
-            return NIXL_IN_PROG;
-        }
+    // Progress data rails to kick off transfers (single-threaded mode)
+    nixl_status_t progress_status = rail_manager.progressActiveDataRails();
+    if (progress_status == NIXL_IN_PROG) {
+        return NIXL_IN_PROG;
     }
 
     // For very small transfers we can check for local completions immediately.
@@ -1167,14 +1136,20 @@ nixl_status_t
 nixlLibfabricEngine::checkXfer(nixlBackendReqH *handle) const {
     auto backend_handle = static_cast<nixlLibfabricBackendH *>(handle);
 
-    if (!progress_thread_enabled_) {
-        nixl_status_t progress_status = rail_manager.progressActiveDataRails();
-        if (progress_status != NIXL_SUCCESS && progress_status != NIXL_IN_PROG) {
-            NIXL_ERROR << "Failed to progress data rails in checkXfer";
-            return progress_status;
-        }
+    // Progress both data and control rails (initiator side)
+    nixl_status_t data_status = rail_manager.progressActiveDataRails();
+    if (data_status != NIXL_SUCCESS && data_status != NIXL_IN_PROG) {
+        NIXL_ERROR << "Failed to progress data rails in checkXfer";
+        return data_status;
     }
-    // Then check for completions after processing any pending completions
+
+    nixl_status_t control_status = rail_manager.progressAllControlRails();
+    if (control_status != NIXL_SUCCESS && control_status != NIXL_IN_PROG) {
+        NIXL_ERROR << "Failed to progress control rails in checkXfer";
+        return control_status;
+    }
+
+    // Check for completions after processing any pending completions
     if (backend_handle->is_completed()) {
         NIXL_DEBUG << "Data transfer completed successfully";
         if (backend_handle->has_notif && backend_handle->operation_ == nixl_xfer_op_t::NIXL_READ) {
@@ -1384,15 +1359,20 @@ nixlLibfabricEngine::genNotif(const std::string &remote_agent, const std::string
 
 nixl_status_t
 nixlLibfabricEngine::getNotifs(notif_list_t &notif_list) {
-    if (!progress_thread_enabled_) {
-        nixl_status_t progress_status = rail_manager.progressActiveDataRails();
-        if (progress_status != NIXL_SUCCESS && progress_status != NIXL_IN_PROG) {
-            NIXL_ERROR << "Failed to progress data rails in getNotifs";
-            return progress_status;
-        }
+    // Progress both data and control rails (target side)
+    nixl_status_t data_status = rail_manager.progressActiveDataRails();
+    if (data_status != NIXL_SUCCESS && data_status != NIXL_IN_PROG) {
+        NIXL_ERROR << "Failed to progress data rails in getNotifs";
+        return data_status;
     }
 
-    // Then check for available notifications after processing completions
+    nixl_status_t control_status = rail_manager.progressAllControlRails();
+    if (control_status != NIXL_SUCCESS && control_status != NIXL_IN_PROG) {
+        NIXL_ERROR << "Failed to progress control rails in getNotifs";
+        return control_status;
+    }
+
+    // Check for available notifications after processing completions
     // Thread-safe access to internal notification list
     {
         std::lock_guard<std::mutex> lock(notif_mutex_);
@@ -1412,102 +1392,6 @@ nixlLibfabricEngine::getNotifs(notif_list_t &notif_list) {
     }
 
     return NIXL_IN_PROG;
-}
-
-/****************************************
- * ConnectionManagement Thread Function
- *****************************************/
-
-// Background progress function that continuously processes completions on all rails
-nixl_status_t
-nixlLibfabricEngine::cmThread() {
-    NIXL_DEBUG << "CM: Thread started successfully";
-
-    // Main progress loop - continuously process completions on all rails
-    while (!cm_thread_stop_.load()) {
-
-        nixl_status_t status = rail_manager.progressAllControlRails();
-        if (status == NIXL_SUCCESS) {
-            NIXL_DEBUG << "CM: Processed completions on control rails";
-        } else if (status != NIXL_IN_PROG && status != NIXL_SUCCESS) {
-            NIXL_ERROR << "CM: Failed to process completions on control rails";
-            return NIXL_ERR_BACKEND;
-        }
-        // Sleep briefly to avoid spinning too aggressively when blocking cq read is not used
-        if (!rail_manager.getControlRail(0).blocking_cq_sread_supported) {
-            std::this_thread::yield();
-        }
-    }
-    NIXL_DEBUG << "CM: Thread exiting cleanly";
-    return NIXL_SUCCESS;
-}
-
-/****************************************
- * Progress Thread Function (Data Rails Only)
- *****************************************/
-
-// Progress thread that continuously processes completions only on data rails
-nixl_status_t
-nixlLibfabricEngine::progressThread() {
-    NIXL_DEBUG << "PT: Thread started successfully for data rails only";
-    // Main progress loop - continuously process completions only on data rails
-    while (!progress_thread_stop_.load()) {
-        // Process completions only on data rails (non-blocking)
-        bool any_completions = false;
-        nixl_status_t status = rail_manager.progressActiveDataRails();
-        if (status == NIXL_SUCCESS) {
-            any_completions = true;
-            NIXL_DEBUG << "PT: Processed completions on data rails";
-        } else if (status != NIXL_IN_PROG && status != NIXL_SUCCESS) {
-            NIXL_ERROR << "PT: Failed to process completions on data rails";
-            // Don't return error, continue for robustness
-        }
-        if (!any_completions) {
-            std::this_thread::yield(); // Hint to scheduler, but no forced sleep
-        }
-    }
-    NIXL_DEBUG << "PT: Thread exiting cleanly";
-    return NIXL_SUCCESS;
-}
-
-void
-nixlLibfabricEngine::postShutdownCompletion() {
-    NIXL_DEBUG << "Posting shutdown signal to wake up background thread";
-    // Send shutdown message to self on rail 0 if self-connection exists
-    auto self_conn_it = connections_.find(localAgent);
-    if (self_conn_it != connections_.end() && self_conn_it->second &&
-        rail_manager.getNumDataRails() > 0) {
-        const size_t rail_id = 0; // Use rail 0 for shutdown signal
-
-        // Allocate control request
-        const size_t control_rail_id = 0;
-        const size_t shutdown_msg_len = 8; // "SHUTDOWN" length
-        nixlLibfabricReq *control_request =
-            rail_manager.getControlRail(control_rail_id)
-                .allocateControlRequest(shutdown_msg_len, LibfabricUtils::getNextXferId());
-        if (!control_request) {
-            NIXL_ERROR << "Failed to allocate control request for shutdown";
-            return;
-        }
-
-        // Copy shutdown message to the control request buffer
-        std::strcpy(static_cast<char *>(control_request->buffer), "SHUTDOWN");
-        control_request->buffer_size = shutdown_msg_len;
-
-        nixl_status_t status = rail_manager.postControlRequest(
-            nixlLibfabricRailManager::ControlMessageType::DISCONNECT_REQ,
-            control_request,
-            self_conn_it->second->rail_remote_addr_list_[rail_id][0],
-            self_conn_it->second->agent_index_);
-
-        if (status == NIXL_SUCCESS) {
-            NIXL_DEBUG << "Shutdown signal posted successfully on rail " << rail_id;
-        } else {
-            NIXL_ERROR << "Failed to post shutdown signal on rail " << rail_id;
-        }
-    } else {
-        NIXL_ERROR << "Could not find self-connection or rails not initialized";
-    }
 }
 
 /****************************************
@@ -1548,8 +1432,7 @@ nixlLibfabricEngine::processNotification(const std::string &serialized_notif) {
                << " expected_completions=" << expected_completions;
 
     {
-        std::lock_guard<std::mutex> lock(receiver_tracking_mutex_);
-
+        // Single-threaded access - no mutex needed
         // Use try_emplace to construct in-place - eliminates extra copy
         auto [it, inserted] = pending_notifications_.try_emplace(notif_xfer_id, notif_xfer_id);
 
@@ -1698,8 +1581,7 @@ nixlLibfabricEngine::processConnectionRequest(uint16_t agent_idx,
 void
 nixlLibfabricEngine::addReceivedXferId(uint16_t xfer_id) {
     {
-        std::lock_guard<std::mutex> lock(receiver_tracking_mutex_);
-
+        // Single-threaded access - no mutex needed
         // Use try_emplace to construct in-place - eliminates extra copy
         // First parameter: map key for lookup
         // Second parameter: constructor argument for PendingNotification
@@ -1731,7 +1613,7 @@ nixlLibfabricEngine::addReceivedXferId(uint16_t xfer_id) {
 
 void
 nixlLibfabricEngine::checkPendingNotifications() {
-    std::lock_guard<std::mutex> lock(receiver_tracking_mutex_);
+    // Single-threaded access - no mutex needed
     auto it = pending_notifications_.begin();
     while (it != pending_notifications_.end()) {
         // Check BOTH conditions: fragments complete AND writes complete

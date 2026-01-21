@@ -177,15 +177,6 @@ class nixlLibfabricEngine : public nixlBackendEngine {
     friend class nixlLibfabricRail; // Allow nixlLibfabricRail to access private members
 
 private:
-    // Threading infrastructure - declared first to match initialization order
-    std::atomic<bool> cm_thread_stop_;
-
-    // Store user's original progress thread preference
-    bool progress_thread_enabled_;
-
-    // Progress thread delay in microseconds
-    std::chrono::microseconds progress_thread_delay_;
-
     // Rail Manager - Stack allocated for better performance (mutable for const methods)
     mutable nixlLibfabricRailManager rail_manager;
 
@@ -199,15 +190,6 @@ private:
     mutable std::unordered_map<std::string, std::shared_ptr<nixlLibfabricConnection>> connections_;
     mutable std::vector<std::string> agent_names_; // List of agent names for easy access
 
-    // Threading infrastructure - remaining members
-    // Connection Management (CM) thread
-    std::thread cm_thread_;
-    std::condition_variable cm_cv_;
-
-    // Progress thread for data rail CQs only
-    std::thread progress_thread_;
-    std::atomic<bool> progress_thread_stop_;
-
     // Mutex for connection state tracking
     mutable std::mutex connection_state_mutex_;
 
@@ -218,8 +200,7 @@ private:
     std::mutex notif_mutex_;
     notif_list_t notifMainList_;
 
-    // Receiver Side XFER_ID Tracking
-    std::mutex receiver_tracking_mutex_;
+    // Receiver Side XFER_ID Tracking (no mutex needed - single-threaded access)
     std::unordered_set<uint32_t> received_remote_writes_; // All received XFER_IDs (global)
 
     // Notification Queuing
@@ -277,16 +258,6 @@ private:
     std::unique_ptr<nixlLibfabricCudaCtx> cudaCtx_;
     bool cuda_addr_wa_; // CUDA address workaround flag
 #endif
-
-    // ConnectionManagement thread and completion processing
-    nixl_status_t
-    cmThread();
-    void
-    postShutdownCompletion();
-    // Progress thread for data rail CQs only
-    nixl_status_t
-    progressThread();
-
 
     // Engine message processing methods
     void

@@ -609,7 +609,7 @@ nixlLibfabricRailManager::progressActiveDataRails() {
         }
 
         // Process completions on active data rails
-        nixl_status_t status = data_rails_[rail_id]->progressCompletionQueue(false);
+        nixl_status_t status = data_rails_[rail_id]->progressCompletionQueue();
         if (status == NIXL_SUCCESS) {
             any_completions = true;
             NIXL_DEBUG << "Processed completions on active data rail " << rail_id;
@@ -635,7 +635,7 @@ nixlLibfabricRailManager::progressAllControlRails() {
     bool any_completions = false;
     for (size_t rail_id = 0; rail_id < num_control_rails_; ++rail_id) {
         nixl_status_t status =
-            control_rails_[rail_id]->progressCompletionQueue(true); // Blocking for control rails
+            control_rails_[rail_id]->progressCompletionQueue(); // Non-blocking (single-threaded)
         if (status == NIXL_SUCCESS) {
             any_completions = true;
             NIXL_DEBUG << "Processed completion on control rail " << rail_id;
