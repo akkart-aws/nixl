@@ -39,7 +39,7 @@
 #define NIXL_LIBFABRIC_DEFAULT_CONTROL_RAILS 1
 
 // Batch CQ Reads: Read up to 16 completions per fi_cq_read() syscall
-#define NIXL_LIBFABRIC_CQ_BATCH_SIZE 16
+#define NIXL_LIBFABRIC_CQ_BATCH_SIZE 64
 
 // Sockets provider requires short timeout to maintain software progress during fi_cq_sread().
 // Long timeouts block in poll(), preventing message processing. EFA uses hardware completions.
