@@ -931,6 +931,20 @@ nixlLibfabricRail::processRecvCompletion(struct fi_cq_data_entry *comp) const {
     NIXL_TRACE << "Received control message type " << msg_type << " agent_idx=" << agent_idx
                << " XFER_ID=" << xfer_id << " imm_data=" << std::hex << comp->data << std::dec;
 
+    // Post a new receive using new resource management system
+    nixlLibfabricReq *new_req = allocateControlRequest(NIXL_LIBFABRIC_SEND_RECV_BUFFER_SIZE,
+                                                       LibfabricUtils::getNextXferId());
+    if (!new_req) {
+        NIXL_ERROR << "Failed to allocate request for subsequent receive on rail " << rail_id;
+        return NIXL_ERR_BACKEND;
+    }
+    nixl_status_t status = postRecv(new_req);
+    if (status != NIXL_SUCCESS) {
+        NIXL_ERROR << "Failed to post subsequent receive on rail " << rail_id;
+        releaseRequest(new_req);
+        return status;
+    }
+
     if (msg_type == NIXL_LIBFABRIC_MSG_CONNECT) {
         NIXL_TRACE << "Processing connection request on rail " << rail_id
                    << " Xfer_id :" << xfer_id;
@@ -992,19 +1006,7 @@ nixlLibfabricRail::processRecvCompletion(struct fi_cq_data_entry *comp) const {
 
     releaseRequest(req);
 
-    // Post a new receive using new resource management system
-    nixlLibfabricReq *new_req = allocateControlRequest(NIXL_LIBFABRIC_SEND_RECV_BUFFER_SIZE,
-                                                       LibfabricUtils::getNextXferId());
-    if (!new_req) {
-        NIXL_ERROR << "Failed to allocate request for subsequent receive on rail " << rail_id;
-        return NIXL_ERR_BACKEND;
-    }
-    nixl_status_t status = postRecv(new_req);
-    if (status != NIXL_SUCCESS) {
-        NIXL_ERROR << "Failed to post subsequent receive on rail " << rail_id;
-        releaseRequest(new_req);
-        return status;
-    }
+
     return NIXL_SUCCESS;
 }
 
